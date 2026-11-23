@@ -1,0 +1,30 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": [
+      "ES2022",
+      "DOM"
+    ],
+    "module": "commonjs",
+    "moduleResolution": "node10",
+    "ignoreDeprecations": "6.0",
+    "strict": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+    "declaration": false,
+    "sourceMap": false,
+    "outDir": "dist-core",
+    "rootDir": "src/core",
+    "types": []
+  },
+  "include": [
+    "src/core/**/*.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    "tmp",
+    "tmp/**",
+    "assets"
+  ]
+}

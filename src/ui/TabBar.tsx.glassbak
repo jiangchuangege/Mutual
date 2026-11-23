@@ -1,0 +1,92 @@
+import { useRouter } from 'expo-router';
+import React from 'react';
+import { Pressable, StyleSheet, Text, View } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
+
+import { color, font, radius } from './theme';
+
+export type TabKey = 'today' | 'life' | 'care' | 'cinema' | 'us';
+
+const TABS: Array<{ key: TabKey; href: string; emoji: string; label: string }> = [
+  { key: 'today', href: '/', emoji: '🏠', label: '今天' },
+  { key: 'life', href: '/life', emoji: '🗂️', label: '生活' },
+  { key: 'care', href: '/care', emoji: '🌿', label: '关怀' },
+  { key: 'cinema', href: '/cinema', emoji: '🎬', label: '影院' },
+  { key: 'us', href: '/us', emoji: '💞', label: '我们' },
+];
+
+export function TabBar({ active }: { active: TabKey }) {
+  const router = useRouter();
+  const insets = useSafeAreaInsets();
+
+  return (
+    <View style={[styles.host, { paddingBottom: Math.max(8, insets.bottom) }]}>
+      <View style={styles.bar}>
+        {TABS.map((tab) => {
+          const isActive = tab.key === active;
+          return (
+            <Pressable
+              key={tab.key}
+              onPress={() => {
+                if (!isActive) router.replace(tab.href as never);
+              }}
+              style={styles.item}
+            >
+              <View style={[styles.iconWrap, isActive ? styles.iconWrapActive : null]}>
+                <Text style={{ fontSize: 17, opacity: isActive ? 1 : 0.55 }}>{tab.emoji}</Text>
+              </View>
+              <Text
+                style={[
+                  font.tiny,
+                  {
+                    marginTop: 2,
+                    color: isActive ? color.primaryInk : color.inkFaint,
+                    fontWeight: isActive ? '700' : '500',
+                  },
+                ]}
+              >
+                {tab.label}
+              </Text>
+            </Pressable>
+          );
+        })}
+      </View>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  host: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    bottom: 0,
+    alignItems: 'center',
+  },
+  bar: {
+    flexDirection: 'row',
+    backgroundColor: 'rgba(255,252,250,0.97)',
+    borderRadius: radius.xl,
+    borderWidth: 1,
+    borderColor: color.line,
+    paddingHorizontal: 6,
+    paddingVertical: 6,
+    marginHorizontal: 12,
+    alignSelf: 'stretch',
+    justifyContent: 'space-between',
+    shadowColor: '#B58C79',
+    shadowOpacity: 0.14,
+    shadowRadius: 14,
+    shadowOffset: { width: 0, height: 6 },
+    elevation: 6,
+  },
+  item: { flex: 1, alignItems: 'center', paddingVertical: 4 },
+  iconWrap: {
+    width: 34,
+    height: 26,
+    borderRadius: radius.pill,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  iconWrapActive: { backgroundColor: color.primarySoft },
+});

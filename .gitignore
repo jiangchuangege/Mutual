@@ -1,0 +1,84 @@
+# Learn more https://docs.github.com/en/get-started/getting-started-with-git/ignoring-files
+
+# dependencies
+node_modules/
+
+# Expo
+.expo/
+dist/
+web-build/
+expo-env.d.ts
+
+# Native
+.kotlin/
+*.orig.*
+*.jks
+*.p8
+*.p12
+*.key
+*.mobileprovision
+
+# Metro
+.metro-health-check*
+
+# debug
+npm-debug.*
+yarn-debug.*
+yarn-error.*
+
+# macOS
+.DS_Store
+*.pem
+
+# local env files
+.env*.local
+
+# typescript
+*.tsbuildinfo
+
+# generated native folders
+/ios
+/android
+
+# ---- Mutual extra ignores ----
+server/data/
+*.keystore
+*.jks
+*.apk
+*.aab
+dist-core/
+android/app/build/
+android/build/
+android/.gradle/
+shots/
+tmp/
+*.log
+# 本地/临时产物 & 私人数据（绝不进公开仓库）
+*.tar.gz
+20261122-twospace/
+20261122-twospace.tar.gz
+tsconfig.json.bak
+dist-core_bak/
+dist-core.bak/
+android/app/build/
+android/build/
+android/.gradle/
+.gradle/
+tmp/
+*.log
+server/data/audio/
+server/data/backgrounds/
+server/data/photos/
+server/data/avatars/
+server/data/games/
+server/data/
+server/*.log
+*.tar
+*.bak
+*.accentbak
+*.herodbak
+*.flairbak
+*.icobak
+*.themebak
+*.bgbak
+dist-core*

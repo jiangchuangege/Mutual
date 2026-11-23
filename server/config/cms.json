@@ -1,0 +1,5 @@
+{
+  "_说明": "片库接口清单。改完这个文件重启服务（或 POST /api/cms/reload）即可生效，前端不用发版。",
+  "_示例": "{\"id\":\"a1\",\"url\":\"https://你的接口/api.php/provide/vod\",\"label\":\"源A\",\"enabled\":true}",
+  "apis": []
+}

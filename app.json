@@ -1,0 +1,63 @@
+{
+  "expo": {
+    "name": "Mutual",
+    "slug": "twospace",
+    "version": "2.0.0",
+    "orientation": "portrait",
+    "scheme": "twospace",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "light",
+    "backgroundColor": "#FFF8F4",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.twospace.app"
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#FFF8F4",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": false,
+      "edgeToEdgeEnabled": true,
+      "package": "com.twospace.app",
+      "permissions": [
+        "android.permission.REQUEST_INSTALL_PACKAGES",
+        "android.permission.INTERNET"
+      ]
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "extra": {
+      "rtcAppId": "80341501274e4ff6857f89b8604bb3f7",
+      "rtcTokenServer": ""
+    },
+    "plugins": [
+      "expo-router",
+      "expo-status-bar",
+      [
+        "expo-audio",
+        {
+          "microphonePermission": "双人空间需要使用麦克风录制语音留言与语音通话"
+        }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "双人空间需要访问相册，把你们选的照片存进回忆册"
+        }
+      ],
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "usesCleartextTraffic": true
+          }
+        }
+      ],
+      "expo-image"
+    ]
+  }
+}

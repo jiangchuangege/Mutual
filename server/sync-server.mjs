@@ -1,0 +1,1745 @@
+/**
+ * TwoSpace 同步服务器 v2 —— **账号模型**（零依赖，Node 18+）
+ *
+ * 为什么重写：v1 让服务端给每台手机分配「A 端 / B 端」，于是所有问题都围绕
+ * "谁是 A、谁是 B"打转：两台手机都被分到 B、一个端上留着别人的档案、
+ * 自己跟自己绑定……用户说得对：**账号不一样，就是不同的账户**，
+ * 端这种东西本来就不该出现在产品里。
+ *
+ * v2 的规则：
+ *   1. 每个人注册一个**账号**（账号 ID 唯一，形如 TW8K3M9Q），带 6 位登录码
+ *   2. 一台手机登录一个账号；换手机用「账号 ID + 登录码」登录，数据跟着账号走
+ *   3. 每个账号一开始有自己的**个人空间**；两个账号互相确认绑定后，合并成一个**双人空间**
+ *   4. 服务端用 token 认人：token → 账号 → 空间 + 内部槽位（A/B 只是内部槽位，界面永不显示）
+ *   5. 严格隔离：没有 token 拿不到任何数据；别的账号的空间你连"存在"都看不到
+ *
+ * 接口：
+ *   GET  /ping                                       连通性探测
+ *   GET  /health                                     只给计数，不含任何个人信息
+ *   POST /api/account/create {name,birthDate,gender,avatarUri,pin,deviceId}
+ *   POST /api/account/login  {accountId,pin,deviceId}
+ *   GET  /api/account/me                             (Bearer token) 账号 + 对方 + 绑定状态
+ *   POST /api/rpc            {method,args}           (Bearer token)
+ *   GET  /api/wait?rev=N                             (Bearer token) 长轮询
+ *   POST /api/pair/request   {targetId}              (Bearer token) 搜索账号 ID 发请求
+ *   POST /api/pair/accept                            (Bearer token)
+ *   POST /api/pair/decline                           (Bearer token)
+ *   POST /api/pair/reset                             (Bearer token) 解绑并各自清空，重新开始
+ *   POST /api/restore        {state}                 (Bearer token) 空间为空时用本机数据重建
+ *
+ * 环境变量：
+ *   PORT=8787  HOST=0.0.0.0  DATA_FILE=server/data/space.json
+ *   TWOSPACE_NO_LISTEN=1   只加载领域逻辑、不监听端口（测试用）
+ */
+
+import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import zlib from 'node:zlib';
+import { createRequire } from 'node:module';
+import { fileURLToPath } from 'node:url';
+
+import { createWebSocketLayer } from './wsCore.mjs';
+import { buildApk, buildEnvStatus } from './buildApk.mjs';
+
+/*
+ * 影院相关的两个模块是"可选"的。
+ *
+ * 有些机器上只部署了本文件（比如只想加一个导入页），没有 cmsProxy.mjs / watchHub.mjs；
+ * 静态 import 会让整个服务器起不来 —— 那样连账号都登不上，代价太大。
+ * 所以改成动态加载：缺了就只是没有影院接口，其它功能一切正常。
+ */
+let handleCms = null;
+let handleWatch = null;
+try {
+  const mod = await import('./cmsProxy.mjs');
+  handleCms = mod.handleCms ?? null;
+} catch (err) {
+  console.log(`[twospace] 没有 cmsProxy.mjs，影院片库接口不启用（${err instanceof Error ? err.message : err}）`);
+}
+try {
+  const mod = await import('./watchHub.mjs');
+  handleWatch = mod.handleWatch ?? null;
+} catch (err) {
+  console.log(`[twospace] 没有 watchHub.mjs，弹幕/评论中继不启用（${err instanceof Error ? err.message : err}）`);
+}
+
+const require = createRequire(import.meta.url);
+const { Hub } = require('../dist-core/hub.js');
+
+/*
+ * APK 包名解析（纯 JS 读 zip + 二进制 AndroidManifest）。
+ * 客户端上传 APK 时也算一次：有了包名，手机点卡片才能直接打开那个游戏。
+ */
+let packageNameOfApk = null;
+/** 取色算法（dist-core/shellAccent.js）：背景首帧 → 主色 */
+let dominantAccent = null;
+try {
+  ({ dominantAccent } = require('../dist-core/shellAccent.js'));
+} catch (err) {
+  console.log('[twospace] 没有 dist-core/shellAccent.js：背景主色自动取色不启用');
+}
+try {
+  ({ packageNameOfApk } = require('../dist-core/apkInfo.js'));
+} catch (err) {
+  console.log(`[twospace] 没有 dist-core/apkInfo.js：APK 游戏只能安装、不能直接打开（${err instanceof Error ? err.message : err}）`);
+}
+
+/** 从一段 base64 里读出 APK 包名；读不到返回 null */
+function apkPackageFromBase64(b64) {
+  if (!packageNameOfApk || typeof b64 !== 'string' || !b64) return null;
+  try {
+    const buf = Buffer.from(b64, 'base64');
+    if (buf.length < 4 || buf[0] !== 0x50 || buf[1] !== 0x4b) return null; // 不是 zip
+    return packageNameOfApk(new Uint8Array(buf), (b) => zlib.inflateRawSync(b));
+  } catch {
+    return null;
+  }
+}
+
+/** 从服务器上已存好的 APK 文件里读出包名 */
+function apkPackageFromAssetPath(assetPath) {
+  if (!packageNameOfApk) return null;
+  try {
+    const name = String(assetPath ?? '').replace(/^\/game\//, '');
+    if (!/\.apk$/i.test(name)) return null;
+    const file = path.join(uploadDir('game'), path.basename(name));
+    if (!fs.existsSync(file)) return null;
+    return packageNameOfApk(new Uint8Array(fs.readFileSync(file)), (b) => zlib.inflateRawSync(b));
+  } catch {
+    return null;
+  }
+}
+
+/** imageio-ffmpeg 自带的静态 ffmpeg（pip 装到用户目录） */
+const FFMPEG =
+  process.env.FFMPEG_PATH ||
+  `${process.env.HOME || '/home/admin'}/.local/lib/python3.12/site-packages/imageio_ffmpeg/binaries/ffmpeg-linux-x86_64-v9.0.2`;
+
+/**
+ * 从背景文件抽首帧并算主色。
+ *
+ * 做法：ffmpeg 把首帧缩到 16×16 输出 rawvideo rgb24（正好 768 字节），
+ * 再喂给纯函数 dominantAccent() —— 这样不用装任何图像解码库。
+ * 拿不到就返回 null（客户端回退默认青蓝），绝不影响上传本身。
+ */
+function extractBackgroundAccent(file) {
+  if (!dominantAccent) return null;
+  try {
+    const { execFileSync } = require('node:child_process');
+    const raw = execFileSync(
+      FFMPEG,
+      ['-v', 'error', '-i', file, '-frames:v', '1', '-vf', 'scale=16:16', '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-'],
+      { timeout: 20000, maxBuffer: 4 * 1024 * 1024 },
+    );
+    if (!raw || raw.length < 256) return null;
+    const bytes = new Uint8Array(raw.buffer, raw.byteOffset, raw.length);
+    // 16×16 的 rgb24 → 补成 rgba 结构喂给算法（每像素 4 字节）
+    const rgba = new Uint8Array(16 * 16 * 4);
+    for (let i = 0; i < 256; i += 1) {
+      rgba[i * 4] = bytes[i * 3] ?? 0;
+      rgba[i * 4 + 1] = bytes[i * 3 + 1] ?? 0;
+      rgba[i * 4 + 2] = bytes[i * 3 + 2] ?? 0;
+      rgba[i * 4 + 3] = 255;
+    }
+    const res = dominantAccent(rgba);
+    return res && res.confidence > 0.05 ? res.hex : null;
+  } catch (err) {
+    console.log(`[background] 取色失败：${err instanceof Error ? err.message : err}`);
+    return null;
+  }
+}
+
+/**
+ * 给视频背景截一张首帧 JPG（客户端在视频解码出来之前先铺这张）。
+ * 拿不到就算了，不影响上传。
+ */
+function extractBackgroundPoster(file, outFile) {
+  try {
+    const { execFileSync } = require('node:child_process');
+    execFileSync(
+      FFMPEG,
+      ['-v', 'error', '-y', '-i', file, '-frames:v', '1', '-vf', 'scale=720:-2', '-q:v', '5', outFile],
+      { timeout: 25000, maxBuffer: 4 * 1024 * 1024 },
+    );
+    return fs.existsSync(outFile) && fs.statSync(outFile).size > 1024;
+  } catch (err) {
+    console.log(`[background] 首帧截图失败：${err instanceof Error ? err.message : err}`);
+    return false;
+  }
+}
+
+const PORT = Number(process.env.PORT ?? 8787);const HOST = process.env.HOST ?? '0.0.0.0';
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const DATA_FILE = process.env.DATA_FILE ?? path.join(HERE, 'data', 'space.json');
+const startedAt = Date.now();
+
+/** 账号 ID 字符集：去掉了容易看错的 0/1/I/O */
+const ID_CHARS = '23456789ABCDEFGHJKMNPQRSTUVWXYZ';
+
+function randomId(prefix = 'TW') {
+  let out = '';
+  const bytes = crypto.randomBytes(6);
+  for (let i = 0; i < 6; i += 1) out += ID_CHARS[bytes[i] % ID_CHARS.length];
+  return `${prefix}${out}`;
+}
+
+function normalizeAccountId(raw) {
+  return String(raw ?? '')
+    .replace(/[\s-]/g, '')
+    .toUpperCase()
+    .slice(0, 12);
+}
+
+function hashPin(pin, accountId) {
+  // 简单但足够：登录码只用于"另一台手机登录同一个账号"，加账号 ID 当盐
+  return crypto.createHash('sha256').update(`${accountId}:${pin}`).digest('hex');
+}
+
+function newToken() {
+  return crypto.randomBytes(24).toString('hex');
+}
+
+// ---------------------------------------------------------------------------
+// 数据（accounts / pairs / sessions），落盘见 saveNow()
+// ---------------------------------------------------------------------------
+
+/**
+ * @type {{
+ *   version: number,
+ *   accounts: Record<string, {
+ *     id: string, name: string, gender: string, birthDate: string, avatarUri: string|null,
+ *     pinHash: string, createdAt: number, lastSeenAt: number, pairId: string,
+ *   }>,
+ *   pairs: Record<string, {
+ *     id: string, a: string, b: string|null, createdAt: number, boundAt: number|null,
+ *     pending: {accountId: string, at: number}|null,
+ *     state: object|null,
+ *   }>,
+ *   sessions: Record<string, {accountId: string, createdAt: number}>,
+ * }}
+ */
+const db = {
+  version: 2,
+  accounts: {},
+  pairs: {},
+  sessions: {},
+};
+
+/** 每个双人空间一份 Hub（密钥是 pairId） */
+const hubs = new Map();
+/** 登录失败次数：防暴力猜登录码 */
+const loginFails = new Map();
+/** 全局版本号：任何空间变化都 +1，客户端据此判断"要不要收这份快照" */
+let revision = 0;
+/**
+ * 重启后的版本号下限。
+ *
+ * 为什么要有：客户端用 `rev < 我见过的最大 rev 就丢弃` 来防旧快照，
+ * 而这个计数以前每次重启都从 0 重新数 —— 手机端已经见过 25，
+ * 服务端重启后又从 0 开始，于是**后面所有快照都被客户端当成旧的丢掉**，
+ * 表现就是"右上角一直绿着已连接，但怎么点都不同步"。
+ * 给一个足够大的起步值，配合落盘持久化，就能保证序号永远只增不减。
+ */
+const REVISION_FLOOR = 1_000_000;
+/** 长轮询等待者 */
+const waiters = new Set();
+/** WS 层（后面创建） */
+let ws = null;
+
+function bump() {
+  revision += 1;
+  for (const waiter of [...waiters]) waiter();
+  // 长连接也要立刻推一份新投影，否则手机上要等下一次操作才看得到变化。
+  // （每个连接推的是它自己那个账号的投影，跨空间不会串数据）
+  try {
+    ws?.broadcast?.();
+  } catch {
+    // 广播失败不影响状态本身
+  }
+  scheduleSave();
+}
+
+function newHub() {
+  const hub = new Hub({ scale: 1, latencyMs: 0, clockSkew: { A: 0, B: 0 } });
+  hub.subscribe('A', bump);
+  hub.subscribe('B', bump);
+  return hub;
+}
+
+function hubOf(pairId) {
+  let hub = hubs.get(pairId);
+  if (!hub) {
+    hub = newHub();
+    hubs.set(pairId, hub);
+  }
+  return hub;
+}
+
+/** 这个账号在它的空间里是哪个内部槽位（A=创建者，B=后来绑定进来的） */
+function roleOf(accountId) {
+  const account = db.accounts[accountId];
+  if (!account) return null;
+  const pair = db.pairs[account.pairId];
+  if (!pair) return null;
+  if (pair.a === accountId) return 'A';
+  if (pair.b === accountId) return 'B';
+  return null;
+}
+
+function pairOf(accountId) {
+  const account = db.accounts[accountId];
+  return account ? db.pairs[account.pairId] ?? null : null;
+}
+
+function otherAccountId(accountId) {
+  const pair = pairOf(accountId);
+  if (!pair) return null;
+  if (pair.a === accountId) return pair.b;
+  if (pair.b === accountId) return pair.a;
+  return null;
+}
+
+/** 账号的档案写进自己的槽位（账号记录是档案的权威来源） */
+function seedProfile(pairId, role, account) {
+  const hub = hubOf(pairId);
+  hub.updateMyProfile(role, {
+    name: account.name,
+    birthDate: account.birthDate,
+    gender: account.gender,
+  });
+  if (account.avatarUri) hub.setMyAvatar(role, account.avatarUri);
+  // 空间里那个人的固定 ID = 账号 ID：一处身份，不用记两个
+  try {
+    hub.adoptPublicId(role, account.id);
+  } catch {
+    // 老版本 core 没有这个方法时忽略（不影响绑定）
+  }
+}
+
+/** 新建一个"个人空间"（只有自己，还没绑定） */
+function createSoloPair(accountId) {
+  const pairId = `pair_${accountId}`;
+  db.pairs[pairId] = {
+    id: pairId,
+    a: accountId,
+    b: null,
+    createdAt: Date.now(),
+    boundAt: null,
+    pending: null,
+    state: null,
+  };
+  db.accounts[accountId].pairId = pairId;
+  hubs.delete(pairId);
+  seedProfile(pairId, 'A', db.accounts[accountId]);
+  return pairId;
+}
+
+// ---------------------------------------------------------------------------
+// 持久化
+// ---------------------------------------------------------------------------
+
+function serializePair(pair) {
+  return { ...pair, state: hubs.has(pair.id) ? hubOf(pair.id).serialize() : pair.state };
+}
+
+let saveTimer = null;
+function scheduleSave() {
+  if (saveTimer) return;
+  saveTimer = setTimeout(() => {
+    saveTimer = null;
+    saveNow();
+  }, 400);
+}
+
+function saveNow() {
+  try {
+    fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
+    const pairs = {};
+    for (const [id, pair] of Object.entries(db.pairs)) pairs[id] = serializePair(pair);
+    const payload = JSON.stringify(
+      {
+        savedAt: Date.now(),
+        version: 2,
+        // 版本号也要落盘：它重启后归零的话，已经连过的手机就会把新快照当成"旧的"丢掉
+        revision,
+        accounts: db.accounts,
+        pairs,
+        sessions: db.sessions,
+      },
+      null,
+      0,
+    );
+    const tmp = `${DATA_FILE}.tmp`;
+    fs.writeFileSync(tmp, payload, 'utf8');
+    fs.renameSync(tmp, DATA_FILE);
+  } catch (err) {
+    console.warn(`[twospace] 存档失败：${err instanceof Error ? err.message : err}`);
+  }
+}
+
+function loadPersisted() {
+  try {
+    if (!fs.existsSync(DATA_FILE)) return false;
+    const raw = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+
+    // v1 存档（单个空间 + roleOwnerId）：**不迁移**。
+    // 它是"服务端分配 A/B 端"时代的产物，身份本来就是错的，硬迁会把错误带过来。
+    // 保留文件、以空账号库启动，用户重新注册一次即可（账号模型下这一步很轻）。
+    if (!raw || raw.version !== 2 || !raw.accounts) {
+      console.log('[twospace] 检测到旧版存档（v1 端分配模型），已跳过，按空账号库启动');
+      return false;
+    }
+
+    db.accounts = raw.accounts ?? {};
+    db.pairs = raw.pairs ?? {};
+    db.sessions = raw.sessions ?? {};
+    // 版本号接着上次的数往下走（只增不减），否则重启后客户端会丢快照。
+    // 另外给一个**很大的起步值**：老客户端可能已经见过几千号，从 0 重新数会让
+    // 它把新快照当成"旧的"静默丢掉。revision 对客户端只是一个不透明序号，
+    // 跳大没有任何副作用，只用来保证"后写的永远比先写的大"。
+    const persisted = typeof raw.revision === 'number' ? raw.revision : 0;
+    revision = Math.max(revision, persisted, REVISION_FLOOR);
+    for (const [pairId, pair] of Object.entries(db.pairs)) {
+      const hub = newHub();
+      if (pair.state) hub.hydrate(pair.state);
+      hubs.set(pairId, hub);
+    }
+    console.log(
+      `[twospace] 已恢复 ${Object.keys(db.accounts).length} 个账号 / ${Object.keys(db.pairs).length} 个空间（rev=${revision}）`,
+    );
+    return true;
+  } catch (err) {
+    console.warn(`[twospace] 读取存档失败，按空账号库启动：${err instanceof Error ? err.message : err}`);
+    return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 账号 API（领域逻辑，HTTP 和测试共用）
+// ---------------------------------------------------------------------------
+
+function fail(error) {
+  return { ok: false, error };
+}
+
+function ok(value = null) {
+  return { ok: true, value };
+}
+
+function validProfile(input) {
+  const name = String(input?.name ?? '').trim().slice(0, 20);
+  const birthDate = String(input?.birthDate ?? '').trim();
+  const gender = input?.gender === 'male' || input?.gender === 'female' ? input.gender : 'other';
+  if (!name) return { error: '昵称不能为空' };
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(birthDate)) return { error: '生日格式应为 YYYY-MM-DD' };
+  return { name, birthDate, gender };
+}
+
+function createAccount(input) {
+  const profile = validProfile(input);
+  if (profile.error) return fail(profile.error);
+  const pin = String(input?.pin ?? '').trim();
+  if (!/^\d{6}$/.test(pin)) return fail('登录码必须是 6 位数字');
+
+  // 账号 ID 唯一（理论上碰撞概率极低，仍然检查）
+  let accountId = randomId('TW');
+  for (let i = 0; i < 12 && db.accounts[accountId]; i += 1) accountId = randomId('TW');
+
+  db.accounts[accountId] = {
+    id: accountId,
+    name: profile.name,
+    gender: profile.gender,
+    birthDate: profile.birthDate,
+    avatarUri: typeof input?.avatarUri === 'string' ? input.avatarUri : null,
+    pinHash: hashPin(pin, accountId),
+    createdAt: Date.now(),
+    lastSeenAt: Date.now(),
+    pairId: '',
+  };
+  const pairId = createSoloPair(accountId);
+  // 空间里那个人的固定 ID 就是账号 ID：一处身份，不用记两个
+  const token = newToken();
+  db.sessions[token] = { accountId, createdAt: Date.now() };
+  bump();
+  return ok({ accountId, token, pairId, role: 'A', bound: false });
+}
+
+function login(input) {
+  const accountId = normalizeAccountId(input?.accountId);
+  const pin = String(input?.pin ?? '').trim();
+  if (!accountId) return fail('请输入账号 ID');
+  if (!/^\d{6}$/.test(pin)) return fail('请输入 6 位登录码');
+  const account = db.accounts[accountId];
+  if (!account) return fail('没有这个账号，检查一下账号 ID');
+
+  const fails = loginFails.get(accountId) ?? { count: 0, until: 0 };
+  if (fails.until > Date.now()) {
+    const sec = Math.ceil((fails.until - Date.now()) / 1000);
+    return fail(`登录码连续输错，请 ${sec} 秒后再试`);
+  }
+  if (account.pinHash !== hashPin(pin, accountId)) {
+    const count = fails.count + 1;
+    loginFails.set(accountId, { count, until: count >= 5 ? Date.now() + 60_000 : 0 });
+    return fail(count >= 5 ? '登录码连续输错 5 次，请 1 分钟后再试' : '登录码不对');
+  }
+  loginFails.delete(accountId);
+  account.lastSeenAt = Date.now();
+  const token = newToken();
+  db.sessions[token] = { accountId, createdAt: Date.now() };
+  const role = roleOf(accountId);
+  const pair = pairOf(accountId);
+  bump();
+  return ok({ accountId, token, pairId: account.pairId, role, bound: Boolean(pair?.boundAt) });
+}
+
+function accountOfToken(token) {
+  if (!token) return null;
+  const session = db.sessions[token];
+  if (!session) return null;
+  const account = db.accounts[session.accountId];
+  if (!account) return null;
+  account.lastSeenAt = Date.now();
+  return account;
+}
+
+function me(accountId) {
+  const account = db.accounts[accountId];
+  if (!account) return fail('账号不存在');
+  const pair = pairOf(accountId);
+  const partnerId = otherAccountId(accountId);
+  const partner = partnerId ? db.accounts[partnerId] : null;
+  const role = roleOf(accountId);
+  const hub = hubOf(account.pairId);
+  const snap = hub.snapshot(role);
+  return ok({
+    account: {
+      id: account.id,
+      name: account.name,
+      gender: account.gender,
+      birthDate: account.birthDate,
+      avatarUri: account.avatarUri,
+      role,
+    },
+    pair: {
+      id: account.pairId,
+      bound: Boolean(pair?.boundAt),
+      boundAt: pair?.boundAt ?? null,
+      pending: pair?.pending ? { fromName: db.accounts[pair.pending.accountId]?.name ?? '', at: pair.pending.at } : null,
+    },
+    partner: partner
+      ? {
+          id: partner.id,
+          name: partner.name,
+          // 只有绑定之后才把对方的资料给出去
+          gender: pair?.boundAt ? snap.members[role === 'A' ? 'B' : 'A'].gender : null,
+          publicId: partner.id,
+        }
+      : null,
+    rev: revision,
+  });
+}
+
+/** 搜对方账号 ID 发绑定请求（不泄露对方任何档案内容，只说"存在/不存在"） */
+function requestBind(accountId, rawTargetId) {
+  const meAccount = db.accounts[accountId];
+  if (!meAccount) return fail('账号不存在');
+  const myPair = pairOf(accountId);
+  if (myPair?.b) return fail('你已经在双人空间里了，需要先解绑');
+
+  const targetId = normalizeAccountId(rawTargetId);
+  if (!targetId) return fail('请输入对方的账号 ID');
+  if (targetId === accountId) return fail('这是你自己的账号 ID，填对方的');
+  const target = db.accounts[targetId];
+  if (!target) return fail(`没找到账号 ${targetId}，让对方在「我们」页确认一下他的账号 ID`);
+  const targetPair = pairOf(targetId);
+  if (!targetPair) return fail('对方的空间还没准备好，请稍后再试');
+  if (targetPair.b) return fail('对方已经在双人空间里了');
+
+  // 对方之前已经请求过我 → 双向确认，直接绑定
+  if (myPair?.pending && myPair.pending.accountId === targetId) {
+    return acceptBind(accountId);
+  }
+  // 我已经请求过对方，重复点一次不算错
+  if (targetPair.pending && targetPair.pending.accountId === accountId) {
+    return ok({ paired: false });
+  }
+  targetPair.pending = { accountId, at: Date.now() };
+  bump();
+  return ok({ paired: false });
+}
+
+/**
+ * 同意绑定：把两个账号并进同一个双人空间。
+ *
+ * 目标空间是**对方的个人空间**（对方是创建者 → 内部槽位 A），
+ * 我作为 B 并进去：我的档案写进 B 槽，我原来的个人空间作废。
+ */
+function acceptBind(accountId) {
+  const myPair = pairOf(accountId);
+  if (!myPair) return fail('账号不存在');
+  if (myPair.b) return fail('你已经在双人空间里了');
+
+  // 谁是我要绑的人
+  let otherId = null;
+  if (myPair.pending && myPair.pending.accountId !== accountId) {
+    otherId = myPair.pending.accountId;
+  }
+  if (!otherId) {
+    // 我没有待处理请求：看看是不是"我请求过别人、对方现在同意了"
+    for (const pair of Object.values(db.pairs)) {
+      if (pair.pending && pair.pending.accountId === accountId && pair.a !== accountId) {
+        otherId = pair.a;
+        break;
+      }
+    }
+  }
+  if (!otherId) return fail('没有待确认的绑定请求');
+  const other = db.accounts[otherId];
+  if (!other) return fail('对方的账号已经不存在了');
+  const targetPair = pairOf(otherId);
+  if (!targetPair || targetPair.b) return fail('对方已经在别的双人空间里了');
+  if (targetPair.id === myPair.id) return fail('你们已经在同一个空间里了');
+
+  // 我的档案并进对方的空间（B 槽）；对方的档案本来就已在 A 槽
+  seedProfile(targetPair.id, 'B', db.accounts[accountId]);
+  targetPair.b = accountId;
+  targetPair.pending = null;
+  targetPair.boundAt = Date.now();
+  hubOf(targetPair.id).bindPair('A');
+
+  // 我原来的个人空间作废（里面只有我自己的档案，已经搬到目标空间了）
+  if (myPair.id !== targetPair.id) {
+    delete db.pairs[myPair.id];
+    hubs.delete(myPair.id);
+  }
+  db.accounts[accountId].pairId = targetPair.id;
+  bump();
+  return ok({ paired: true, pairId: targetPair.id });
+}
+
+function declineBind(accountId) {
+  const pair = pairOf(accountId);
+  if (!pair) return fail('账号不存在');
+  if (pair.pending && pair.pending.accountId !== accountId) {
+    pair.pending = null;
+    bump();
+    return ok(null);
+  }
+  // 我请求过别人 → 撤回
+  let cleared = false;
+  for (const p of Object.values(db.pairs)) {
+    if (p.pending && p.pending.accountId === accountId) {
+      p.pending = null;
+      cleared = true;
+    }
+  }
+  if (!cleared) return fail('没有待处理的请求');
+  bump();
+  return ok(null);
+}
+
+/**
+ * 解绑并各自清空（「我们重来一次」）。
+ *
+ * 两个账号都保留（档案还在），空间各自回到"只有自己、未绑定、没有任何数据"。
+ */
+function resetPair(accountId) {
+  const pair = pairOf(accountId);
+  if (!pair) return fail('账号不存在');
+  const oldPairId = pair.id;
+  const members = [pair.a, pair.b].filter((id) => typeof id === 'string' && id);
+
+  // 清空这个空间的全部内容（两个人的档案也一并清掉，账号本身保留）
+  hubOf(oldPairId).resetToEmpty();
+  pair.b = null;
+  pair.boundAt = null;
+  pair.pending = null;
+  for (const id of members) {
+    if (db.accounts[id]) db.accounts[id].pairId = '';
+  }
+  // 每个人回到自己的个人空间（档案来自账号记录，所以不会丢昵称/生日/头像）
+  for (const id of members) {
+    if (db.accounts[id]) createSoloPair(id);
+  }
+  // 旧共享空间如果没人再用就删掉（注意：创建者的个人空间 ID 可能正好复用这个 id，
+  // 那就不能删，否则刚建好的空间立刻消失 —— 踩过）
+  const stillUsed = Object.values(db.accounts).some((acc) => acc.pairId === oldPairId);
+  if (!stillUsed) {
+    delete db.pairs[oldPairId];
+    hubs.delete(oldPairId);
+  }
+  bump();
+  return ok(null);
+}
+
+/** 空间还是空的：允许某一方把本机数据推回来（服务端被清过时用） */
+function restoreState(accountId, state) {
+  if (!state || typeof state.spaceId !== 'string') return fail('缺少有效的空间数据');
+  const pair = pairOf(accountId);
+  if (!pair) return fail('账号不存在');
+  const hub = hubOf(pair.id);
+  const snap = hub.snapshot('A');
+  if (snap.boundAt !== null || snap.members.A.profileCompleted || snap.members.B.profileCompleted) {
+    return fail('服务端已经有数据了，不需要恢复');
+  }
+  if (!hub.hydrate(state)) return fail('这份数据无法恢复（格式不对）');
+  bump();
+  return ok({ bound: hub.snapshot('A').boundAt !== null });
+}
+
+// ---------------------------------------------------------------------------
+// 快照投影：把账号层的"待处理请求"叠进空间快照
+// ---------------------------------------------------------------------------
+
+function stateFor(accountId) {
+  const account = db.accounts[accountId];
+  if (!account) return null;
+  const role = roleOf(accountId);
+  if (!role) return null;
+  const pair = pairOf(accountId);
+  const hub = hubOf(account.pairId);
+  let snap;
+  try {
+    snap = hub.snapshot(role);
+  } catch {
+    return null;
+  }
+  const pending = pair?.pending ?? null;
+  if (pending && !pair?.b) {
+    const other = db.accounts[pending.accountId];
+    if (pending.accountId === accountId) {
+      // 我发出去的请求：等我这边确认（界面显示"已发出"）
+      snap.bindRequest = { fromRole: role, at: pending.at };
+    } else if (other) {
+      snap.bindRequest = {
+        fromRole: role === 'A' ? 'B' : 'A',
+        at: pending.at,
+        fromName: other.name,
+        fromPublicId: other.id,
+      };
+    }
+  } else {
+    // 我发出去的请求其实记在**对方**的空间上：这里反查一次，
+    // 否则请求方界面永远看不到"已发出，等 TA 确认"。
+    let outgoing = null;
+    for (const p of Object.values(db.pairs)) {
+      if (p.pending && p.pending.accountId === accountId && p.a !== accountId) {
+        outgoing = p.pending;
+        break;
+      }
+    }
+    snap.bindRequest = outgoing ? { fromRole: role, at: outgoing.at } : null;
+  }
+  return snap;
+}
+
+// ---------------------------------------------------------------------------
+// HTTP
+// ---------------------------------------------------------------------------
+
+function readBody(req) {
+  return new Promise((resolve) => {
+    let raw = '';
+    let tooBig = false;
+    req.on('data', (chunk) => {
+      raw += chunk;
+      // 上限设为 80MB：比"音频 24MB / 游戏 64MB 的 base64"都大一点。
+      // 以前这里是 4MB 并且直接 req.destroy()，于是上传几 MB 的音乐/游戏时
+      // 手机会看到 "fetch failed: Connection reset"（服务端把连接掐了）。
+      if (raw.length > 200 * 1024 * 1024) {
+        tooBig = true;
+        req.destroy();
+      }
+    });
+    req.on('close', () => {
+      if (tooBig) resolve({ __tooBig: true });
+    });
+    req.on('end', () => {
+      try {
+        resolve(raw ? JSON.parse(raw) : {});
+      } catch {
+        resolve({});
+      }
+    });
+    req.on('error', () => resolve({}));
+  });
+}
+
+function json(res, status, payload) {
+  const body = JSON.stringify(payload);
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'access-control-allow-origin': '*',
+    'access-control-allow-headers': 'content-type, authorization',
+    'access-control-allow-methods': 'GET,POST,OPTIONS',
+    'cache-control': 'no-store',
+    'content-length': Buffer.byteLength(body),
+  });
+  res.end(body);
+}
+
+// ---------------------------------------------------------------------------
+// 上传（头像 / 空间背景图）
+//
+// 以前这两样存的都是**手机本地的 file:// 路径**：
+//   1. 另一个人的手机根本打不开那个路径（换机就更没了）；
+//   2. 头像那个字段甚至连渲染都没有。
+// 现在统一"上传到这台服务器"，状态里只放一个相对路径
+// （`/avatar/xxx.jpg`、`/background/xxx.jpg`），两台手机都从同一台服务器取图。
+// ---------------------------------------------------------------------------
+
+/** kind → 目录 + URL 前缀。头像/背景/照片/音乐分开存，方便分别清理 */
+const UPLOAD_KINDS = {
+  avatar: { dir: 'avatars', prefix: '/avatar/' },
+  background: { dir: 'backgrounds', prefix: '/background/' },
+  photo: { dir: 'photos', prefix: '/photo/' },
+  // 本地音乐：用户在自己手机上选的文件，传到服务器后对方也能"一起听"
+  audio: { dir: 'audio', prefix: '/audio/' },
+  // 大型游戏（单文件 HTML 或任意网页资源）：存成文件，客户端按网址加载，
+  // 这样游戏体积不再受"同步状态大小"限制（用户要求：再大都能支持）
+  game: { dir: 'games', prefix: '/game/' },
+};
+/** 一张图的上限：3MB base64（≈2.2MB 原图，够清楚了） */
+const UPLOAD_MAX_B64 = 3 * 1024 * 1024;
+/** 一首歌的上限：24MB base64（≈18MB 音频，普通 mp3 一首 4–10MB 足够） */
+const AUDIO_MAX_B64 = 40 * 1024 * 1024; // ≈30MB 音频
+/** 一个游戏文件的上限：64MB base64（≈47MB 原文件，Unity WebGL 也能塞） */
+const GAME_MAX_B64 = 140 * 1024 * 1024; // ≈99MB 原文件（base64 后 132MB）
+const GAME_EXT = { html: 'text/html; charset=utf-8', htm: 'text/html; charset=utf-8', js: 'text/javascript; charset=utf-8', css: 'text/css; charset=utf-8', wasm: 'application/wasm', data: 'application/octet-stream', png: 'image/png', jpg: 'image/jpeg', webp: 'image/webp', mp3: 'audio/mpeg', ogg: 'audio/ogg', json: 'application/json', apk: 'application/vnd.android.package-archive' };
+const IMAGE_EXT = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', webp: 'image/webp' };
+/**
+ * 自定义背景的扩展名 → MIME（图片 + 视频）。
+ * 以前这里直接用了 IMAGE_EXT，于是 .mp4 拿不到 MIME → 404，
+ * 表现就是"上传成功但背景永远不变"（客户端视频加载 404）。
+ */
+const BACKGROUND_EXT = {
+  ...IMAGE_EXT,
+  mp4: 'video/mp4',
+  webm: 'video/webm',
+  mov: 'video/quicktime',
+  m4v: 'video/x-m4v',
+};
+
+/** 音频扩展名 → MIME（Android 播放器靠它选解码器） */
+const AUDIO_EXT = {
+  mp3: 'audio/mpeg',
+  m4a: 'audio/mp4',
+  aac: 'audio/aac',
+  wav: 'audio/wav',
+  ogg: 'audio/ogg',
+  flac: 'audio/flac',
+  opus: 'audio/opus',
+};
+
+function uploadDir(kind) {
+  return path.join(path.dirname(DATA_FILE), UPLOAD_KINDS[kind].dir);
+}
+
+function saveUpload(kind, accountId, data, extRaw) {
+  if (!UPLOAD_KINDS[kind]) return { ok: false, error: '未知的上传类型' };
+  const isAudio = kind === 'audio';
+  const isGame = kind === 'game';
+  const maxB64 = isGame ? GAME_MAX_B64 : isAudio ? AUDIO_MAX_B64 : UPLOAD_MAX_B64;
+  if (typeof data !== 'string' || data.length < 64) {
+    return { ok: false, error: isAudio ? '没有收到音频数据' : '没有收到图片数据' };
+  }
+  if (data.length > maxB64) {
+    return {
+      ok: false,
+      error: isAudio ? '这首歌太大了（上限约 18MB），换一首小一点的' : '图片太大了，换一张小一点的',
+    };
+  }
+  const clean = isGame || isAudio
+    ? data.replace(/^data:[a-z0-9.+-]+\/[a-z0-9.+-]+;base64,/i, '').replace(/\s/g, '')
+    : data.replace(/^data:image\/[a-z]+;base64,/i, '').replace(/\s/g, '');
+  let buf;
+  try {
+    buf = Buffer.from(clean, 'base64');
+  } catch {
+    return { ok: false, error: isAudio ? '音频数据不合法' : '图片数据不合法' };
+  }
+  if (buf.length < 32) return { ok: false, error: isAudio ? '音频数据不合法' : '图片数据不合法' };
+  const extRawLower = typeof extRaw === 'string' ? extRaw.toLowerCase() : '';
+  const table = isGame ? GAME_EXT : isAudio ? AUDIO_EXT : IMAGE_EXT;
+  const fallback = isGame ? 'html' : isAudio ? 'mp3' : 'jpg';
+  const ext = table[extRawLower] ? extRawLower : fallback;
+  const name = `${accountId}-${Date.now().toString(36)}.${ext}`;
+  const dir = uploadDir(kind);
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    // 头像/背景换图就删旧文件；照片可能有很多张，保留历史；
+    // 音乐保留历史（一起听列表里可能还有别的歌在引用旧文件）
+    if (kind !== 'photo' && !isAudio && !isGame) for (const old of fs.readdirSync(dir)) {
+      if (old.startsWith(`${accountId}-`)) {
+        try {
+          fs.unlinkSync(path.join(dir, old));
+        } catch {
+          // 删不掉就算了
+        }
+      }
+    }
+    fs.writeFileSync(path.join(dir, name), buf);
+  } catch (err) {
+    return { ok: false, error: `保存图片失败：${err instanceof Error ? err.message : String(err)}` };
+  }
+  console.log(`[${kind}] 账号=${accountId} 大小=${Math.round(buf.length / 1024)}KB 文件=${name}`);
+  return { ok: true, value: { path: `${UPLOAD_KINDS[kind].prefix}${name}`, bytes: buf.length } };
+}
+
+function serveUpload(kind, name, res) {
+  const meta = UPLOAD_KINDS[kind];
+  const safe = String(name).replace(/[^A-Za-z0-9._-]/g, '');
+  const ext = (safe.split('.').pop() ?? '').toLowerCase();
+  const type =
+    kind === 'game'
+      ? GAME_EXT[ext]
+      : kind === 'audio'
+        ? AUDIO_EXT[ext]
+        : kind === 'background'
+          ? BACKGROUND_EXT[ext]
+          : IMAGE_EXT[ext];
+  const notFound = () => {
+    res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
+    res.end('not found');
+  };
+  if (!meta || !safe || !type) {
+    notFound();
+    return;
+  }
+  let buf;
+  try {
+    buf = fs.readFileSync(path.join(uploadDir(kind), safe));
+  } catch {
+    notFound();
+    return;
+  }
+  res.writeHead(200, {
+    'content-type': type,
+    'content-length': buf.length,
+    // 关键：告诉浏览器"这是附件、文件名是这个"。
+    // 不加的话，部分浏览器（尤其国产浏览器/微信内置）会把 .apk 当未知类型处理，
+    // 用户点了既不下载也不提示安装（用户实测）。
+    'content-disposition': `attachment; filename="${safe}"`,
+    'x-content-type-options': 'nosniff',
+    // 文件名带时间戳，内容不会变：让手机自己缓存，别每次进首页都重新下
+    'cache-control': 'public, max-age=31536000, immutable',
+    'access-control-allow-origin': '*',
+  });
+  res.end(buf);
+}
+
+function tokenFrom(req, url, body) {  const header = req.headers.authorization;
+  if (typeof header === 'string' && header.toLowerCase().startsWith('bearer ')) {
+    return header.slice(7).trim();
+  }
+  if (typeof body?.token === 'string' && body.token) return body.token;
+  const q = url.searchParams.get('token');
+  return q ?? '';
+}
+
+/** 需要登录的接口：token → accountId，拿不到就 401 */
+function requireAccount(req, res, url, body) {
+  const token = tokenFrom(req, url, body);
+  const account = accountOfToken(token);
+  if (!account) {
+    json(res, 401, { ok: false, code: 'auth', error: '登录状态已失效，请重新登录（账号 ID + 登录码）' });
+    return null;
+  }
+  return account;
+}
+
+async function handle(req, res) {
+  const url = new URL(req.url ?? '/', `http://localhost:${PORT}`);
+
+  // 公共影视后端：片库代理（零输入）+ 跨域中转 + 弹幕/评论/房间
+  // 这两个模块可能是没部署的（见文件头的动态 import），没有就跳过
+  try {
+    if (handleCms && (await handleCms(req, res, url))) return;
+    if (handleWatch && (await handleWatch(req, res, url))) return;
+  } catch (err) {
+    json(res, 500, { ok: false, error: err instanceof Error ? err.message : String(err) });
+    return;
+  }
+
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, {
+      'access-control-allow-origin': '*',
+      'access-control-allow-headers': 'content-type, authorization',
+      'access-control-allow-methods': 'GET,POST,OPTIONS',
+      'access-control-max-age': '86400',
+    });
+    res.end();
+    return;
+  }
+
+  if (url.pathname === '/ping') {
+    json(res, 200, {
+      ok: true,
+      pong: true,
+      service: 'twospace-sync',
+      version: 2,
+      model: 'account',
+      rev: revision,
+      uptimeSec: Math.round((Date.now() - startedAt) / 1000),
+      ts: Date.now(),
+    });
+    return;
+  }
+
+  // 健康检查**不含任何个人信息**：谁能连上这个端口都能看到，不能泄露账号
+  if (url.pathname === '/health') {
+    const pairs = Object.values(db.pairs);
+    json(res, 200, {
+      ok: true,
+      version: 2,
+      model: 'account',
+      rev: revision,
+      accounts: Object.keys(db.accounts).length,
+      pairs: pairs.length,
+      boundPairs: pairs.filter((p) => p.b).length,
+      uptimeSec: Math.round((Date.now() - startedAt) / 1000),
+    });
+    return;
+  }
+
+  if (url.pathname === '/api/account/create' && req.method === 'POST') {
+    const body = await readBody(req);
+    const res0 = createAccount(body);
+    if (!res0.ok) {
+      json(res, 400, res0);
+      return;
+    }
+    saveNow();
+    json(res, 200, res0);
+    return;
+  }
+
+  if (url.pathname === '/api/account/login' && req.method === 'POST') {
+    const body = await readBody(req);
+    const result = login(body);
+    if (!result.ok) {
+      json(res, 400, result);
+      return;
+    }
+    saveNow();
+    json(res, 200, result);
+    return;
+  }
+
+  if (url.pathname === '/api/account/me') {
+    const body = req.method === 'POST' ? await readBody(req) : {};
+    const account = requireAccount(req, res, url, body);
+    if (!account) return;
+    json(res, 200, me(account.id));
+    return;
+  }
+
+  if (url.pathname === '/api/pair/request' && req.method === 'POST') {
+    const body = await readBody(req);
+    const account = requireAccount(req, res, url, body);
+    if (!account) return;
+    const result = requestBind(account.id, body.targetId);
+    json(res, result.ok ? 200 : 400, result);
+    return;
+  }
+
+  if (url.pathname === '/api/pair/accept' && req.method === 'POST') {
+    const body = await readBody(req);
+    const account = requireAccount(req, res, url, body);
+    if (!account) return;
+    const result = acceptBind(account.id);
+    json(res, result.ok ? 200 : 400, result);
+    return;
+  }
+
+  if (url.pathname === '/api/pair/decline' && req.method === 'POST') {
+    const body = await readBody(req);
+    const account = requireAccount(req, res, url, body);
+    if (!account) return;
+    const result = declineBind(account.id);
+    json(res, result.ok ? 200 : 400, result);
+    return;
+  }
+
+  if (url.pathname === '/api/pair/reset' && req.method === 'POST') {
+    const body = await readBody(req);
+    const account = requireAccount(req, res, url, body);
+    if (!account) return;
+    const result = resetPair(account.id);
+    json(res, result.ok ? 200 : 400, result);
+    return;
+  }
+
+  if (url.pathname === '/api/avatar' && req.method === 'POST') {
+    const body = await readBody(req);
+    const account = requireAccount(req, res, url, body);
+    if (!account) return;
+    const result = saveUpload('avatar', account.id, body.data, body.ext);
+    json(res, result.ok ? 200 : 400, result);
+    return;
+  }
+
+  if (url.pathname === '/api/upload' && req.method === 'POST') {
+    const body = await readBody(req);
+    if (body && body.__tooBig) {
+      json(res, 413, { ok: false, error: '这个文件太大了（上限 99MB）' });
+      return;
+    }
+    const account = requireAccount(req, res, url, body);
+    if (!account) return;
+    const kind = String(body.kind ?? 'avatar');
+    const result = saveUpload(kind, account.id, body.data, body.ext);
+    json(res, result.ok ? 200 : 400, result);
+    return;
+  }
+
+  /**
+   * 一键加游戏（给外部脚本/curl 用的接口）。
+   *
+   * POST /api/game/add
+   *   Authorization: Bearer <账号 token>
+   *   { "title":"我的游戏", "code":"<!doctype html>..." }            // 直接给代码
+   *   { "title":"我的游戏", "data":"<base64>", "ext":"html" }        // 给文件（≤99MB）
+   * 可选 players: 1|2（默认 2）。
+   * 返回 { ok, value: <GameSpec> }；加了之后两个人手机上都会出现。
+   */
+  /**
+   * POST /api/game/raw?title=..&ext=apk
+   *
+   * 直接收原始字节（不走 base64），边收边写盘。
+   * 为什么要它：146MB 的 APK 转成 base64 是 195MB，既超过 base64 上限，
+   * 又要在内存里多占 33% —— 大游戏（尤其是安卓包）只能这样传。
+   * 认证放在读流之前：先认人，再收字节，别让陌生人往磁盘写东西。
+   */
+  /**
+   * POST /api/background/raw?type=video
+   *
+   * 自定义背景上传：直接收原始字节（视频几十 MB，走 base64 会多占 33%），
+   * 边收边写盘，写完登记到空间里 —— 两台手机都会用这段当满屏背景。
+   */
+  if (url.pathname === '/api/background/raw' && req.method === 'POST') {
+    const account = requireAccount(req, res, url, {});
+    if (!account) return;
+    const role = roleOf(account.id);
+    const pair = pairOf(account.id);
+    if (!role || !pair) {
+      json(res, 400, { ok: false, error: '这个账号还没绑定空间' });
+      return;
+    }
+    const rawType = String(url.searchParams.get('type') ?? 'video').toLowerCase();
+    const isVideo = rawType !== 'image';
+    const ext = isVideo ? 'mp4' : 'jpg';
+    const dir = uploadDir('background');
+    fs.mkdirSync(dir, { recursive: true });
+    const name = `${account.id}-bg-${Date.now().toString(36)}.${ext}`;
+    const target = path.join(dir, name);
+    const maxBytes = 200 * 1024 * 1024;
+    let got = 0;
+    let aborted = false;
+    const out = fs.createWriteStream(target);
+    const fail = (code, error) => {
+      aborted = true;
+      try {
+        out.destroy();
+        fs.unlinkSync(target);
+      } catch {
+        /* 忽略 */
+      }
+      json(res, code, { ok: false, error });
+    };
+    req.on('data', (chunk) => {
+      got += chunk.length;
+      if (got > maxBytes && !aborted) fail(413, '背景文件太大了（上限 200MB）');
+    });
+    req.on('error', () => {
+      if (!aborted) fail(400, '接收中断');
+    });
+    req.pipe(out);
+    out.on('error', () => {
+      if (!aborted) fail(500, '写盘失败');
+    });
+    out.on('finish', () => {
+      if (aborted) return;
+      const accent = extractBackgroundAccent(target);
+      // 视频：再截一张首帧当"占位海报"，客户端在解码出第一帧之前先铺它
+      let poster = null;
+      if (isVideo) {
+        const posterName = `${name.replace(/\.[^.]+$/, '')}.poster.jpg`;
+        const posterPath = path.join(dir, posterName);
+        if (extractBackgroundPoster(target, posterPath)) poster = `/background/${posterName}`;
+      }
+      const result = hubOf(pair.id).setCustomBackground(role, {
+        url: `/background/${name}`,
+        type: isVideo ? 'video' : 'image',
+        accent: accent ?? undefined,
+        poster: poster ?? undefined,
+      });
+      bump();
+      console.log(`[background/raw] ${(got / 1024 / 1024).toFixed(1)}MB ${isVideo ? 'video' : 'image'} → ${result.ok ? 'ok' : result.error}`);
+      json(res, result.ok ? 200 : 400, result);
+    });
+    return;
+  }
+
+  if (url.pathname === '/api/game/raw' && req.method === 'POST') {
+    const account = requireAccount(req, res, url, {});
+    if (!account) return;
+    const role = roleOf(account.id);
+    const pair = pairOf(account.id);
+    if (!role || !pair) {
+      json(res, 400, { ok: false, error: '这个账号还没绑定空间' });
+      return;
+    }
+    const extRaw = String(url.searchParams.get('ext') ?? 'apk')
+      .toLowerCase()
+      .replace(/[^a-z0-9]/g, '')
+      .slice(0, 5) || 'apk';
+    if (!['apk', 'html'].includes(extRaw)) {
+      json(res, 400, { ok: false, error: '只收 apk / html' });
+      return;
+    }
+    const dir = uploadDir('game');
+    fs.mkdirSync(dir, { recursive: true });
+    const name = `${account.id}-${Date.now().toString(36)}.${extRaw === 'htm' ? 'html' : extRaw}`;
+    const target = path.join(dir, name);
+    const maxBytes = 400 * 1024 * 1024;
+    let got = 0;
+    let aborted = false;
+    const out = fs.createWriteStream(target);
+    const fail = (code, error) => {
+      aborted = true;
+      try {
+        out.destroy();
+        fs.unlinkSync(target);
+      } catch {
+        /* 忽略 */
+      }
+      json(res, code, { ok: false, error });
+    };
+    req.on('data', (chunk) => {
+      got += chunk.length;
+      if (got > maxBytes && !aborted) fail(413, '文件太大了（上限 400MB）');
+    });
+    req.on('error', () => {
+      if (!aborted) fail(400, '接收中断');
+    });
+    req.pipe(out);
+    out.on('error', () => {
+      if (!aborted) fail(500, '写盘失败');
+    });
+    out.on('finish', () => {
+      if (aborted) return;
+      const assetPath = `/game/${name}`;
+      const title = String(url.searchParams.get('title') ?? '').trim().slice(0, 40) || name;
+      const pkg = extRaw === 'apk' ? apkPackageFromAssetPath(assetPath) : null;
+      const result = hubOf(pair.id).addGameAsset(role, {
+        title,
+        assetPath,
+        players: 2,
+        kind: extRaw === 'apk' ? 'native' : 'html',
+        packageName: pkg,
+      });
+      bump();
+      console.log(`[game/raw] ${title} ${(got / 1024 / 1024).toFixed(1)}MB pkg=${pkg ?? '-'} → ${result.ok ? 'ok' : result.error}`);
+      json(res, result.ok ? 200 : 400, result);
+    });
+    return;
+  }
+
+  if (url.pathname === '/api/game/add' && req.method === 'POST') {
+    const body = await readBody(req);
+    if (body && body.__tooBig) {
+      json(res, 413, { ok: false, error: '文件太大（上限 99MB）' });
+      return;
+    }
+    const account = requireAccount(req, res, url, body);
+    if (!account) return;
+    const role = roleOf(account.id);
+    const pair = pairOf(account.id);
+    if (!role || !pair) {
+      json(res, 400, { ok: false, error: '这个账号还没绑定空间' });
+      return;
+    }
+    const hub = hubOf(pair.id);
+    const title = String(body.title ?? '').trim().slice(0, 40) || '上传的游戏';
+    const players = body.players === 1 ? 1 : 2;
+    let result;
+    if (body.data) {
+      const ext = String(body.ext ?? 'html')
+        .toLowerCase()
+        .replace(/[^a-z0-9]/g, '')
+        .slice(0, 5) || 'html';
+      const up = saveUpload('game', account.id, body.data, ext);
+      if (!up.ok) {
+        json(res, 400, up);
+        return;
+      }
+      result = hub.addGameAsset(role, {
+        title,
+        assetPath: up.value.path,
+        players,
+        kind: ext === 'apk' ? 'native' : 'html',
+        // APK 顺手解析包名：手机点卡片才能直接打开这个游戏，而不是反复弹安装器
+        packageName: ext === 'apk' ? apkPackageFromBase64(body.data) : null,
+      });
+    } else if (body.code) {
+      result = hub.addGame(role, {
+        title,
+        code: String(body.code),
+        players,
+        kind: body.kind === 'native' ? 'native' : 'html',
+      });
+    } else {
+      json(res, 400, { ok: false, error: '要带 code（代码）或 data（base64 文件）之一' });
+      return;
+    }
+    json(res, result.ok ? 200 : 400, result);
+    return;
+  }
+
+  /**
+   * GET /import
+   *
+   * 电脑上打开这个页面，就能把「下载来的游戏」直接推进游戏库：
+   * 填账号 + 登录码 → 选文件（可多选/拖进来）→ 两台手机的游戏库里立刻出现。
+   * 手机上也能用，只是手机上直接用 App 里的「导入」按钮更方便。
+   */
+  if (url.pathname === '/import' && req.method === 'GET') {
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+    res.end(IMPORT_PAGE);
+    return;
+  }
+
+  if (url.pathname.startsWith('/avatar/') && req.method === 'GET') {
+    serveUpload('avatar', url.pathname.slice('/avatar/'.length), res);
+    return;
+  }
+
+  // 本地音乐：对方的播放器直接从这里取
+  if (url.pathname.startsWith('/audio/') && req.method === 'GET') {
+    serveUpload('audio', url.pathname.slice('/audio/'.length), res);
+    return;
+  }
+
+  // 大型游戏资源：WebView 直接从这里加载（体积不受同步状态限制）
+  if (url.pathname.startsWith('/game/') && req.method === 'GET') {
+    serveUpload('game', url.pathname.slice('/game/'.length), res);
+    return;
+  }
+
+  if (url.pathname.startsWith('/background/') && req.method === 'GET') {
+    serveUpload('background', url.pathname.slice('/background/'.length), res);
+    return;
+  }
+
+  if (url.pathname.startsWith('/photo/') && req.method === 'GET') {
+    serveUpload('photo', url.pathname.slice('/photo/'.length), res);
+    return;
+  }
+
+  if (url.pathname === '/api/restore' && req.method === 'POST') {
+    const body = await readBody(req);
+    const account = requireAccount(req, res, url, body);
+    if (!account) return;
+    const result = restoreState(account.id, body.state);
+    json(res, result.ok ? 200 : 400, result);
+    return;
+  }
+
+
+  // ---- 云编译：Java 源码 → 可安装 APK ----
+  if (url.pathname === '/api/build/env' && req.method === 'GET') {
+    const account = requireAccount(req, res, url, {});
+    if (!account) return;
+    json(res, 200, { ok: true, value: buildEnvStatus() });
+    return;
+  }
+
+  if (url.pathname === '/api/build' && req.method === 'POST') {
+    const body = await readBody(req);
+    const account = requireAccount(req, res, url, body);
+    if (!account) return;
+    const result = buildApk({ title: body.title, files: body.files });
+    if (!result.ok) {
+      json(res, 400, { ok: false, error: result.error });
+      return;
+    }
+    // 编译产物落到 games/ 目录，客户端按 /game/xxx.apk 下载
+    const dir = uploadDir('game');
+    fs.mkdirSync(dir, { recursive: true });
+    const name = `${account.id}-${Date.now().toString(36)}.apk`;
+    fs.copyFileSync(result.apk, path.join(dir, name));
+    try {
+      fs.unlinkSync(result.apk);
+    } catch {
+      // 临时文件删不掉就算了
+    }
+    console.log(`[build] 账号=${account.id} 产物=${name} ${Math.round(result.bytes / 1024)}KB`);
+    json(res, 200, { ok: true, value: { path: `/game/${name}`, bytes: result.bytes, title: result.title } });
+    return;
+  }
+
+  if (url.pathname === '/api/rpc' && req.method === 'POST') {
+    const body = await readBody(req);
+    const account = requireAccount(req, res, url, body);
+    if (!account) return;
+    const result = runRpc(account.id, String(body.method ?? ''), Array.isArray(body.args) ? body.args : []);
+    json(res, result.ok ? 200 : 400, result);
+    return;
+  }
+
+  if (url.pathname === '/api/wait') {
+    const body = req.method === 'POST' ? await readBody(req) : {};
+    const account = requireAccount(req, res, url, body);
+    if (!account) return;
+    const since = Number(url.searchParams.get('rev') ?? -1);
+    const reply = () => {
+      const state = stateFor(account.id);
+      if (!state) {
+        json(res, 400, { ok: false, error: '空间不可用' });
+        return;
+      }
+      // role 一起下发：绑定之后账号的槽位会从 A 变成 B，
+      // 客户端必须每次都拿到最新槽位，否则会把对方的数据当成自己的。
+      json(res, 200, { ok: true, rev: revision, role: roleOf(account.id), state });
+    };
+    if (since !== revision) {
+      reply();
+      return;
+    }
+    let done = false;
+    const timer = setTimeout(() => {
+      if (done) return;
+      done = true;
+      waiters.delete(waiter);
+      reply();
+    }, 20_000);
+    const waiter = () => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      waiters.delete(waiter);
+      reply();
+    };
+    waiters.add(waiter);
+    req.on('close', () => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      waiters.delete(waiter);
+    });
+    return;
+  }
+
+  json(res, 404, { ok: false, error: 'not found' });
+}
+
+// ---------------------------------------------------------------------------
+// RPC：业务方法仍然跑在 Hub 上（空间内部槽位由 token 解析，客户端不传 role）
+// ---------------------------------------------------------------------------
+
+/** 绝对不能从网上调用的方法 */
+const FORBIDDEN = new Set([
+  'constructor',
+  'hydrate',
+  'serialize',
+  'resetToEmpty',
+  'hydrateProjected',
+  'requestBind',
+  'acceptBind',
+  'declineBind',
+  'bindPair',
+  'createInvite',
+  'regenerateInvite',
+  'extendInvite',
+  'joinWithCode',
+  'clearMemberProfile',
+  'fastForwardCooling',
+]);
+
+function runRpc(accountId, method, args) {
+  const account = db.accounts[accountId];
+  if (!account) return fail('账号不存在');
+  const role = roleOf(accountId);
+  if (!role) return fail('账号还没有空间');
+  if (!method || FORBIDDEN.has(method) || typeof hubOf(account.pairId)[method] !== 'function') {
+    return fail(`不允许的方法：${method}`);
+  }
+  const hub = hubOf(account.pairId);
+  try {
+    /*
+     * 手机端是"先上传文件、再登记"。登记时补一次包名解析：
+     * 这样就算客户端没带 packageName，第二次点卡片也能直接打开游戏。
+     */
+    if (method === 'addGameAsset' && args && args[0] && args[0].assetPath && !args[0].packageName) {
+      const pkg = apkPackageFromAssetPath(args[0].assetPath);
+      if (pkg) args = [{ ...args[0], packageName: pkg }, ...args.slice(1)];
+    }
+    const result = hub[method](role, ...args) ?? ok(null);
+
+    // 档案类写操作：账号记录才是档案的权威来源，这里同步回去
+    if (result.ok && (method === 'updateMyProfile' || method === 'setMyAvatar')) {
+      const snap = hub.snapshot(role);
+      const mine = snap.members[role];
+      account.name = mine.name || account.name;
+      if (mine.gender) account.gender = mine.gender;
+      if (mine.birthDate) account.birthDate = mine.birthDate;
+      account.avatarUri = mine.avatarUri ?? account.avatarUri;
+    }
+    // 每个写操作都留一行日志：同步出问题时，先看服务端到底有没有收到、有没有生效
+    console.log(
+      `[rpc] 账号=${accountId} 空间=${account.pairId} 方法=${method} ` +
+        `${result.ok ? 'ok' : `失败(${result.error})`} rev=${revision}`,
+    );
+    return result;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.log(`[rpc] 账号=${accountId} 方法=${method} 抛异常: ${msg}`);
+    return fail(msg);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket：hello 带 token，服务端认账号
+// ---------------------------------------------------------------------------
+
+ws = createWebSocketLayer({
+  revision: () => revision,
+  stateFor: (client) => (client.accountId ? stateFor(client.accountId) : null),
+  takeRole: (client, msg) => {
+    const token = typeof msg?.token === 'string' ? msg.token : '';
+    const account = accountOfToken(token);
+    if (!account) {
+      client.authError = '登录状态已失效，请重新登录';
+      return null;
+    }
+    client.accountId = account.id;
+    client.pairId = account.pairId;
+    const role = roleOf(account.id);
+    if (!role) {
+      client.authError = '账号还没有空间';
+      return null;
+    }
+    return role;
+  },
+  onHello: (client) => {
+    if (!client.accountId) return;
+    client.pairId = db.accounts[client.accountId]?.pairId ?? null;
+    // 绑定/解绑会改变账号在空间里的槽位，所以每次 hello 都重新算一次
+    const role = roleOf(client.accountId);
+    if (role) client.role = role;
+  },
+  // 每次 hello 都重新解析一次角色（绑定之后槽位会变）
+  refreshRole: true,
+  // **每次推送/每次 rpc 都重新解析**：绑定之后同一个连接属于哪一格会变，
+  // 用连接建立时缓存的角色会让客户端把对方当成自己（真实事故，见 README）
+  roleFor: (client) => (client.accountId ? roleOf(client.accountId) : null),
+  onRpc: (client, method, args) => {
+    if (!client.accountId) return fail('请先登录');
+    const result = runRpc(client.accountId, method, args);
+    if (result.ok) bump();
+    return result;
+  },
+});
+
+// ---------------------------------------------------------------------------
+// 启动
+// ---------------------------------------------------------------------------
+
+/**
+ * 电脑上的导入页（GET /import）。
+ *
+ * 用户的原话：「让我从别的地方下载的游戏直接传到我的游戏库里，还能双人玩」。
+ * 下载游戏基本都在电脑上完成，所以除了 App 里的文件选择，这里再给一个网页：
+ * 账号 + 登录码 → 拖文件 → 直接进库（两台手机都能看到）。
+ */
+const IMPORT_PAGE = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>把游戏传进 Mutual 游戏库</title>
+<style>
+  :root{color-scheme:light}
+  body{margin:0;padding:24px 16px;background:#FBF7F2;color:#2E2A26;
+    font-family:-apple-system,"PingFang SC",system-ui,sans-serif}
+  .wrap{max-width:560px;margin:0 auto}
+  h1{font-size:19px;margin:0 0 6px}
+  p.sub{margin:0 0 18px;font-size:13px;color:#7A7168;line-height:1.6}
+  .card{background:#fff;border:1px solid #EFE6DA;border-radius:14px;padding:16px;margin-bottom:14px}
+  label{display:block;font-size:12px;color:#7A7168;margin:10px 0 5px}
+  input[type=text],input[type=password]{width:100%;box-sizing:border-box;padding:11px 12px;font-size:15px;
+    border:1px solid #E3D8CA;border-radius:10px;background:#fff;color:#2E2A26}
+  #drop{margin-top:14px;border:2px dashed #D9CBB8;border-radius:12px;padding:22px 12px;text-align:center;
+    font-size:13px;color:#8A7F73;background:#FDFBF8}
+  #drop.on{border-color:#E8A0A0;background:#FFF6F2;color:#C4625E}
+  button{margin-top:12px;width:100%;padding:13px;font-size:15px;font-weight:700;border:0;border-radius:12px;
+    background:#E8908C;color:#fff}
+  button:disabled{background:#E3D8CA;color:#9C9186}
+  #log{margin-top:12px;font-size:12.5px;line-height:1.7;white-space:pre-wrap;color:#5C544C}
+  .ok{color:#3F8F5B}
+  .err{color:#C0403C}
+  a{color:#C4625E}
+</style></head><body><div class="wrap">
+<h1>把游戏传进游戏库</h1>
+<p class="sub">支持单个 HTML 游戏文件（.html/.htm），也支持安卓安装包（.apk）。
+传进去之后，两台手机的游戏库里都会出现，点开就能玩；双人联机会自动同步操作。</p>
+
+<div class="card">
+  <label>账号 ID（TW + 6 位数字）</label>
+  <input id="acc" type="text" placeholder="TW123456" autocapitalize="characters">
+  <label>登录码（6 位数字）</label>
+  <input id="pin" type="password" inputmode="numeric" placeholder="••••••">
+  <div id="drop">把 .html / .apk 拖到这里<br>或者点这里选文件</div>
+  <input id="file" type="file" accept=".html,.htm,.apk" multiple hidden>
+  <button id="go" disabled>传到游戏库</button>
+  <div id="log"></div>
+</div>
+<p class="sub">游戏说明：框架会自动把两个人的操作互相镜像，并用同一颗随机种子，
+所以两台手机跑的是同一个世界。想更稳的话，可以让游戏按
+<b>双人联机接口</b>（App 里「复制双人联机接口说明」）写几行代码，是可选的。</p>
+</div>
+<script>
+var files = [];
+var drop = document.getElementById('drop');
+var input = document.getElementById('file');
+var btn = document.getElementById('go');
+var log = document.getElementById('log');
+
+function say(text, cls){ log.innerHTML += '<div class="' + (cls || '') + '">' + text + '</div>'; }
+function refresh(){ btn.disabled = !files.length; drop.textContent = files.length
+  ? ('已选 ' + files.length + ' 个：' + files.map(function(f){ return f.name; }).join('、'))
+  : '把 .html / .apk 拖到这里\\n或者点这里选文件'; }
+
+drop.onclick = function(){ input.click(); };
+input.onchange = function(){ files = Array.prototype.slice.call(input.files || []); refresh(); };
+['dragenter','dragover'].forEach(function(t){ drop.addEventListener(t, function(e){ e.preventDefault(); drop.classList.add('on'); }); });
+['dragleave','drop'].forEach(function(t){ drop.addEventListener(t, function(e){ e.preventDefault(); drop.classList.remove('on'); }); });
+drop.addEventListener('drop', function(e){
+  var list = e.dataTransfer && e.dataTransfer.files ? e.dataTransfer.files : [];
+  files = Array.prototype.slice.call(list);
+  refresh();
+});
+
+function b64(file){
+  return new Promise(function(res, rej){
+    var r = new FileReader();
+    r.onload = function(){ res(String(r.result).split(',')[1] || ''); };
+    r.onerror = function(){ rej(new Error('读文件失败')); };
+    r.readAsDataURL(file);
+  });
+}
+
+btn.onclick = async function(){
+  var acc = document.getElementById('acc').value.trim().toUpperCase();
+  var pin = document.getElementById('pin').value.trim();
+  if (!/^TW\\d{6}$/.test(acc)) { say('账号 ID 长得不对（要 TW + 6 位数字）', 'err'); return; }
+  if (!/^\\d{6}$/.test(pin)) { say('登录码是 6 位数字', 'err'); return; }
+  btn.disabled = true;
+  log.innerHTML = '';
+  try {
+    say('登录中…');
+    var lr = await fetch('/api/account/login', {
+      method:'POST', headers:{'content-type':'application/json'},
+      body: JSON.stringify({ accountId: acc, pin: pin })
+    });
+    var lj = await lr.json();
+    if (!lj.ok) { say('登录失败：' + (lj.error || lr.status), 'err'); btn.disabled = false; return; }
+    var token = lj.value ? lj.value.token : lj.token;
+    say('登录成功，开始上传…', 'ok');
+    for (var i = 0; i < files.length; i++) {
+      var f = files[i];
+      var ext = (/\\.([a-z0-9]+)$/i.exec(f.name) || [,'html'])[1].toLowerCase();
+      if (['html','htm','apk'].indexOf(ext) < 0) { say('跳过 ' + f.name + '（只收 .html/.apk）', 'err'); continue; }
+      var data = await b64(f);
+      var title = f.name.replace(/\\.[a-z0-9]+$/i, '').replace(/[-_]+/g, ' ').slice(0, 40);
+      say('上传 ' + f.name + '（' + Math.round(f.size / 1024 / 1024) + 'MB）…');
+      // 大文件走原始字节上传（base64 会多占 33%，上百 MB 的 APK 装不下）
+      var ok, msg;
+      if (f.size > 24 * 1024 * 1024) {
+        var rr = await fetch('/api/game/raw?ext=' + ext + '&title=' + encodeURIComponent(title), {
+          method:'POST',
+          headers:{ 'authorization':'Bearer ' + token, 'content-type':'application/octet-stream' },
+          body: f
+        });
+        var rj = await rr.json().catch(function(){ return {}; });
+        ok = rr.ok && rj.ok; msg = rj.error || rr.status;
+      } else {
+        var ur = await fetch('/api/game/add', {
+          method:'POST',
+          headers:{'content-type':'application/json','authorization':'Bearer ' + token},
+          body: JSON.stringify({ title: title, data: data, ext: ext === 'htm' ? 'html' : ext, players: 2 })
+        });
+        var uj = await ur.json();
+        ok = ur.ok && uj.ok; msg = uj.error || ur.status;
+      }
+      if (ok) say('✓ ' + title + ' 已进库（两台手机都能看到）', 'ok');
+      else say('✗ ' + f.name + '：' + msg, 'err');
+    }
+    tabsWarn();
+  } catch (err) {
+    say('出错：' + (err && err.message ? err.message : err), 'err');
+  }
+  btn.disabled = false;
+};
+function tabsWarn(){ say('\\n上传完成。回到手机上的「游戏库」，下拉刷新就能看到。'); }
+refresh();
+</script></body></html>`;
+
+const server = http.createServer((req, res) => {
+  void handle(req, res).catch((err) => {
+    json(res, 500, { ok: false, error: err instanceof Error ? err.message : String(err) });
+  });
+});
+
+ws.attach(server);
+loadPersisted();
+
+// 每个空间都要自己 tick（邀请码过期、冷静期、在线状态）
+setInterval(() => {
+  for (const hub of hubs.values()) {
+    try {
+      hub.tick();
+    } catch {
+      // 单个空间出错不能影响别的空间
+    }
+  }
+}, 1000).unref?.();
+
+for (const sig of ['SIGINT', 'SIGTERM']) {
+  process.on(sig, () => {
+    saveNow();
+    process.exit(0);
+  });
+}
+
+/** 供测试用：当前全局版本号 */
+function revisionOf() {
+  return revision;
+}
+
+export {
+  db,
+  hubs,
+  createAccount,
+  login,
+  me,
+  requestBind,
+  acceptBind,
+  declineBind,
+  resetPair,
+  restoreState,
+  stateFor,
+  runRpc,
+  accountOfToken,
+  roleOf,
+  saveNow,
+  loadPersisted,
+  revisionOf,
+};
+
+if (!process.env.TWOSPACE_NO_LISTEN) {
+  server.listen(PORT, HOST, () => {
+    console.log(`[twospace] 同步服务器 v2（账号模型）已启动：http://${HOST}:${PORT}`);
+    console.log('[twospace] 每个人注册自己的账号，两台账号互相确认后组成双人空间');
+  });
+}

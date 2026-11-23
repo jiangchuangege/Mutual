@@ -1,0 +1,453 @@
+import { useRouter } from 'expo-router';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import {
+  ActivityIndicator,
+  FlatList,
+  Image,
+  Pressable,
+  RefreshControl,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TextInput,
+  useWindowDimensions,
+  View,
+} from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
+
+import { getLiveSources, suggestSourceName, type LiveSourceEntry } from '../core/liveConfig';
+import { loadLiveCatalog, type LiveCatalog } from '../core/liveLoad';
+import { groupChannels, searchChannels, type LiveChannel } from '../core/liveSource';
+import { useApp } from '../store';
+import { NightBackdrop, NightPill, WallpaperBadge } from '../ui/NightSky';
+import { night, nightFont, nightShadow } from '../ui/nightTheme';
+import { HealthDot } from '../ui/SourceHealthView';
+import { useToast } from '../ui/components';
+import { Ico } from '../ui/icons';
+
+/**
+ * 电视直播（独立模块，和影院完全分开）
+ *
+ * 用户要求：
+ *   - 「再设计个模块是电视直播台，我加直播源可以看直播电视，例如 CCTV1」
+ *   - 「这个不要跟影院加一块，要独立」→ 本页是 /live，独立路由、独立配置、独立数据
+ *   - 「电视源可以加多个」→ 支持多个播放列表源，顶部可以按源筛选
+ *   - 「显示哪个接口是坏」→ 每个源都有指示灯 + 人话原因，挂了也能看出是哪个
+ *   - 「直播源也要折叠」→ 分组（央视/卫视/地方…）都是可折叠区块
+ */
+
+export default function LiveScreen() {
+  const router = useRouter();
+  const insets = useSafeAreaInsets();
+  const toast = useToast();
+  const { store } = useApp();
+  const { width } = useWindowDimensions();
+
+  const [entries, setEntries] = useState<LiveSourceEntry[]>([]);
+  const [catalog, setCatalog] = useState<LiveCatalog | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [keyword, setKeyword] = useState('');
+  const [sourceFilter, setSourceFilter] = useState<string | null>(null);
+  /** 收起来的分组（默认全部展开，点一下收起） */
+  const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
+
+  const load = useCallback(
+    async (mode: 'init' | 'refresh') => {
+      if (mode === 'init') setLoading(true);
+      else setRefreshing(true);
+      // 直播源和片源接口一样"两个人共用一份"：store.liveSourceUrls 里已经是生效的那份
+      // （服务端共享优先，没连服务器时用本机缓存）。本机缓存里另外存了自定义名字。
+      const localEntries = await getLiveSources();
+      const shared = store.liveSourceUrls;
+      const list: LiveSourceEntry[] = shared.map((url) => {
+        const hit = localEntries.find((e) => e.url === url);
+        return hit ?? { id: url, name: suggestSourceName(url), url, addedAt: 0 };
+      });
+      setEntries(list);
+      if (list.length === 0) {
+        setCatalog(null);
+        setLoading(false);
+        setRefreshing(false);
+        return;
+      }
+      const result = await loadLiveCatalog(list);
+      setCatalog(result);
+      setLoading(false);
+      setRefreshing(false);
+      if (result.okCount === 0) {
+        toast.show('直播源全部不可用，检查一下源地址', 'error');
+      }
+    },
+    [store, toast],
+  );
+
+  useEffect(() => {
+    void load('init');
+  }, [load]);
+
+  /** 当前生效的频道（按源筛选后） */
+  const visibleChannels = useMemo<LiveChannel[]>(() => {
+    if (!catalog) return [];
+    if (!sourceFilter) return catalog.channels;
+    const hit = catalog.sources.find((s) => s.id === sourceFilter);
+    return hit?.channels ?? [];
+  }, [catalog, sourceFilter]);
+
+  const searched = useMemo(
+    () => (keyword.trim() ? searchChannels(visibleChannels, keyword) : visibleChannels),
+    [visibleChannels, keyword],
+  );
+
+  const groups = useMemo(() => groupChannels(searched), [searched]);
+
+  const openChannel = (ch: LiveChannel) => {
+    const alt = ch.urls.slice(1);
+    router.push(
+      `/live-player?id=${encodeURIComponent(ch.id)}&name=${encodeURIComponent(ch.name)}&group=${encodeURIComponent(
+        ch.group,
+      )}&u=${encodeURIComponent(ch.url)}${alt.length > 0 ? `&alt=${encodeURIComponent(JSON.stringify(alt))}` : ''}`,
+    );
+  };
+
+  const totalChannels = catalog?.channels.length ?? 0;
+  const deadSources = catalog?.sources.filter((s) => !s.ok) ?? [];
+
+  // 小屏一排 3 个，大屏 4 个
+  const cols = width >= 520 ? 4 : 3;
+  const cardGap = 8;
+  const cardWidth = Math.floor((width - 28 - cardGap * (cols - 1)) / cols);
+
+  return (
+    <View style={styles.root}>
+      <NightBackdrop variant="live" />
+
+      {/* 顶部：标题 + 入口 */}
+      <View style={[styles.header, { paddingTop: insets.top + 8 }]}>
+        <Pressable onPress={() => router.back()} style={styles.iconBtn} hitSlop={8}>
+          <Text style={{ color: night.text, fontSize: 16 }}>‹</Text>
+        </Pressable>
+        <View style={{ flex: 1, marginLeft: 10 }}>
+          <Text style={nightFont.h1}>电视直播</Text>
+          <Text style={[nightFont.small, { marginTop: 2 }]} numberOfLines={1}>
+            {totalChannels > 0 ? `${totalChannels} 个台 · ${entries.length} 个源` : '还没有配置直播源'}
+            {deadSources.length > 0 ? ` · ${deadSources.length} 个源不可用` : ''}
+          </Text>
+        </View>
+        <Pressable onPress={() => router.push('/live-sources')} style={styles.iconBtn} hitSlop={8}>
+          <Text style={{ color: night.cyan, fontSize: 12, fontWeight: '700' }}>直播源</Text>
+        </Pressable>
+      </View>
+
+      {loading ? (
+        <View style={styles.center}>
+          <ActivityIndicator color={night.cyan} />
+          <Text style={[nightFont.body, { marginTop: 10 }]}>正在读取直播源…</Text>
+        </View>
+      ) : entries.length === 0 ? (
+        /* 空状态：没有源 */
+        <ScrollView contentContainerStyle={{ padding: 20, paddingBottom: 60 }}>
+          <View style={{ alignItems: 'center', marginTop: 20 }}>
+            <WallpaperBadge size={124} caption="内置壁纸：伊蕾娜 · 夜幕" />
+          </View>
+          <Text style={[nightFont.h2, { marginTop: 22, textAlign: 'center' }]}>还没加直播源</Text>
+          <Text style={[nightFont.body, { marginTop: 8, textAlign: 'center', lineHeight: 21 }]}>
+            直播源就是一个播放列表地址（.m3u / .m3u8 / .txt）。{'\n'}
+            加上之后这里会出现央视、卫视等频道，点一下就能看。{'\n'}
+            App 不内置任何频道地址。
+          </Text>
+          <Pressable
+            onPress={() => router.push('/live-sources')}
+            style={[styles.primaryBtn, { marginTop: 22 }]}
+          >
+            <Text style={styles.primaryBtnText}>＋ 添加直播源</Text>
+          </Pressable>
+        </ScrollView>
+      ) : (
+        <>
+          {/* 主视觉：内置壁纸（伊蕾娜·夜幕）+ 源状态 */}
+          <View style={styles.hero}>
+            <WallpaperBadge size={64} />
+            <View style={{ flex: 1, marginLeft: 12 }}>
+              <Text style={[nightFont.h2, { fontSize: 14 }]}>夜幕 · 伊蕾娜</Text>
+              <Text style={[nightFont.small, { marginTop: 3 }]} numberOfLines={2}>
+                内置壁纸同款配色 · 直播和影院是一套夜景视觉
+              </Text>
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 6 }}>
+                <NightPill
+                  label={deadSources.length > 0 ? `${deadSources.length} 个源失效` : '全部源正常'}
+                  tone={deadSources.length > 0 ? 'danger' : 'mint'}
+                />
+                <NightPill label={`${groups.length} 个分组`} tone="violet" />
+              </View>
+            </View>
+          </View>
+
+          {/* 搜索 */}
+          <View style={styles.searchRow}>
+            <TextInput
+              value={keyword}
+              onChangeText={setKeyword}
+              placeholder="搜台，比如 CCTV1 / 湖南卫视"
+              placeholderTextColor={night.textFaint}
+              style={styles.searchInput}
+              returnKeyType="search"
+            />
+            {keyword ? (
+              <Pressable onPress={() => setKeyword('')} style={styles.clearBtn}>
+                <Text style={{ color: night.textDim, fontSize: 11 }}>清除</Text>
+              </Pressable>
+            ) : null}
+          </View>
+
+          {/* 源筛选：每个源一颗胶囊，坏源直接红 */}
+          <ScrollView
+            horizontal
+            showsHorizontalScrollIndicator={false}
+            contentContainerStyle={{ paddingHorizontal: 14, gap: 8, paddingBottom: 8 }}
+          >
+            <Pressable onPress={() => setSourceFilter(null)}>
+              <NightPill label={`全部台`} active={sourceFilter === null} tone="cyan" />
+            </Pressable>
+            {(catalog?.sources ?? []).map((s) => (
+              <Pressable key={s.id} onPress={() => setSourceFilter(s.id)}>
+                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 5 }}>
+                  <NightPill
+                    label={`${s.name}${s.ok ? ` · ${s.channels.length}` : ' · 失效'}`}
+                    active={sourceFilter === s.id}
+                    tone={s.ok ? 'violet' : 'danger'}
+                  />
+                </View>
+              </Pressable>
+            ))}
+          </ScrollView>
+
+          {/* 坏源提示条：直接说清楚哪个源挂了、为什么 */}
+          {deadSources.length > 0 ? (
+            <View style={styles.warnBar}>
+              <HealthDot level="dead" />
+              <View style={{ flex: 1, marginLeft: 6 }}>
+                <Text style={{ color: night.danger, fontSize: 11.5, fontWeight: '700' }}>
+                  {deadSources.map((s) => s.name).join('、')} 读不出来
+                </Text>
+                <Text style={[nightFont.small, { marginTop: 2 }]} numberOfLines={2}>
+                  {deadSources[0].error ?? '未知原因'} · 去「直播源」里换掉它
+                </Text>
+              </View>
+              <Pressable onPress={() => router.push('/live-sources')} hitSlop={6}>
+                <Text style={{ color: night.cyan, fontSize: 11, fontWeight: '700' }}>去处理</Text>
+              </Pressable>
+            </View>
+          ) : null}
+
+          <FlatList
+            data={groups}
+            keyExtractor={(g) => `group-${g.group}`}
+            contentContainerStyle={{ paddingHorizontal: 14, paddingBottom: 40 }}
+            refreshControl={
+              <RefreshControl
+                refreshing={refreshing}
+                onRefresh={() => void load('refresh')}
+                tintColor={night.cyan}
+                colors={[night.cyan]}
+              />
+            }
+            ListEmptyComponent={
+              <View style={styles.center}>
+                <Ico name="live" size="xl" />
+                <Text style={[nightFont.bodyStrong, { marginTop: 10 }]}>没有匹配的台</Text>
+                <Text style={[nightFont.small, { marginTop: 4 }]}>
+                  {keyword ? '换个关键词试试' : '这个源里没有认出频道'}
+                </Text>
+              </View>
+            }
+            renderItem={({ item }) => {
+              const isCollapsed = collapsed[item.group] === true;
+              return (
+                <View style={{ marginBottom: 12 }}>
+                  {/* 分组标题（可折叠） */}
+                  <Pressable
+                    onPress={() =>
+                      setCollapsed((prev) => ({ ...prev, [item.group]: !prev[item.group] }))
+                    }
+                    style={styles.groupHeader}
+                  >
+                    <View style={styles.groupBar} />
+                    <Text style={[nightFont.h2, { flex: 1, marginLeft: 8 }]}>{item.group}</Text>
+                    <Text style={[nightFont.tiny]}>{item.channels.length} 个台</Text>
+                    <Text style={{ color: night.cyan, fontSize: 12, marginLeft: 8, fontWeight: '700' }}>
+                      {isCollapsed ? '›' : '⌄'}
+                    </Text>
+                  </Pressable>
+
+                  {isCollapsed ? null : (
+                    <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: cardGap }}>
+                      {item.channels.map((ch) => (
+                        <ChannelCard
+                          key={ch.id}
+                          channel={ch}
+                          width={cardWidth}
+                          onPress={() => openChannel(ch)}
+                        />
+                      ))}
+                    </View>
+                  )}
+                </View>
+              );
+            }}
+          />
+        </>
+      )}
+    </View>
+  );
+}
+
+/** 单个频道卡片 */
+function ChannelCard({
+  channel,
+  width,
+  onPress,
+}: {
+  channel: LiveChannel;
+  width: number;
+  onPress: () => void;
+}) {
+  const initial = channel.name.replace(/[^\u4e00-\u9fa5A-Za-z0-9]/g, '').slice(0, 2) || '📺';
+  return (
+    <Pressable onPress={onPress} style={[styles.channelCard, { width }]}>
+      {channel.logo ? (
+        <Image source={{ uri: channel.logo }} style={styles.channelLogo} resizeMode="contain" />
+      ) : (
+        <View style={styles.channelLogoFallback}>
+          <Text style={{ color: night.cyan, fontSize: 12, fontWeight: '800' }}>{initial}</Text>
+        </View>
+      )}
+      <Text style={styles.channelName} numberOfLines={2}>
+        {channel.name}
+      </Text>
+      {channel.urls.length > 1 ? (
+        <Text style={{ color: night.textFaint, fontSize: 8.5, marginTop: 1 }}>
+          {channel.urls.length} 条线路
+        </Text>
+      ) : null}
+    </Pressable>
+  );
+}
+
+const styles = StyleSheet.create({
+  root: { flex: 1, backgroundColor: night.bgDeep },
+  header: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 14,
+    paddingBottom: 10,
+  },
+  iconBtn: {
+    paddingHorizontal: 11,
+    paddingVertical: 7,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: night.line,
+    backgroundColor: night.glass,
+  },
+  searchRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    paddingHorizontal: 14,
+    paddingBottom: 10,
+  },
+  hero: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginHorizontal: 14,
+    marginBottom: 12,
+    padding: 10,
+    borderRadius: 16,
+    backgroundColor: night.glass,
+    borderWidth: 1,
+    borderColor: night.line,
+    ...nightShadow.card,
+  },
+  searchInput: {
+    flex: 1,
+    height: 40,
+    borderRadius: 13,
+    backgroundColor: night.glass,
+    borderWidth: 1,
+    borderColor: night.line,
+    paddingHorizontal: 12,
+    color: night.text,
+    fontSize: 13,
+  },
+  clearBtn: {
+    paddingHorizontal: 11,
+    height: 40,
+    borderRadius: 13,
+    borderWidth: 1,
+    borderColor: night.line,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: night.glass,
+  },
+  warnBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginHorizontal: 14,
+    marginBottom: 10,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    borderRadius: 13,
+    backgroundColor: night.dangerSoft,
+    borderWidth: 1,
+    borderColor: `${night.danger}66`,
+  },
+  groupHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 8,
+  },
+  groupBar: {
+    width: 3,
+    height: 15,
+    borderRadius: 2,
+    backgroundColor: night.cyan,
+  },
+  channelCard: {
+    backgroundColor: night.glass,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: night.line,
+    paddingVertical: 10,
+    paddingHorizontal: 8,
+    alignItems: 'center',
+    ...nightShadow.card,
+  },
+  channelLogo: { width: 34, height: 26 },
+  channelLogoFallback: {
+    width: 34,
+    height: 26,
+    borderRadius: 8,
+    backgroundColor: night.cyanSoft,
+    borderWidth: 1,
+    borderColor: night.cyanLine,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  channelName: {
+    color: night.text,
+    fontSize: 11,
+    fontWeight: '600',
+    marginTop: 6,
+    textAlign: 'center',
+    lineHeight: 15,
+  },
+  center: { alignItems: 'center', justifyContent: 'center', paddingVertical: 50, paddingHorizontal: 30 },
+  primaryBtn: {
+    backgroundColor: night.cyan,
+    borderRadius: 14,
+    paddingVertical: 13,
+    alignItems: 'center',
+  },
+  primaryBtnText: { color: night.textOnLight, fontSize: 14, fontWeight: '800' },
+});

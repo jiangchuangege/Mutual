@@ -1,0 +1,12 @@
+const fs = require('node:fs');
+const src = fs.readFileSync('C:/ts/src/core/farmArt.ts', 'utf8');
+const m = src.match(/data:image\/png;base64,([A-Za-z0-9+/=]+)/);
+if (!m) throw new Error('没找到内联图');
+const buf = Buffer.from(m[1], 'base64');
+const w = buf.readUInt32BE(16);
+const h = buf.readUInt32BE(20);
+const bitDepth = buf[24];
+const colorType = buf[25];
+const names = { 0: 'grayscale', 2: 'RGB(无 alpha)', 3: 'palette', 4: 'gray+alpha', 6: 'RGBA' };
+console.log({ w, h, bitDepth, colorType: colorType + ' ' + (names[colorType] || '?'), bytes: buf.length });
+console.log('每像素字节数约', (buf.length / (w * h)).toFixed(2));

@@ -1,0 +1,18 @@
+const fs = require('node:fs');
+const p = 'C:/ts/src/core/farmEngine2.ts';
+let t = fs.readFileSync(p, 'utf8');
+const from = `  TV.video.style.left=r.x+'px';
+  TV.video.style.top=r.y+'px';
+  TV.video.style.width=r.w+'px';
+  TV.video.style.height=r.h+'px';
+  TV.video.style.borderRadius='7px';`;
+const to = `  TV.video.style.left=(r.x+OFFX+4)+'px';
+  TV.video.style.top=(r.y+SAFE+4)+'px';
+  TV.video.style.width=(r.w-8)+'px';
+  TV.video.style.height=(r.h-8)+'px';
+  TV.video.style.borderRadius='5px';
+  TV.video.style.display=TV.failed?'none':'block';`;
+if (!t.includes(from)) throw new Error('没找到样式行');
+t = t.replace(from, to);
+fs.writeFileSync(p, t, 'utf8');
+console.log('电视尺寸/偏移已修正');

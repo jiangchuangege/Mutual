@@ -1,0 +1,108 @@
+import { useVideoPlayer, VideoView } from 'expo-video';
+import React, { useEffect, useState } from 'react';
+import { Image, StyleSheet, View, type StyleProp, type ViewStyle } from 'react-native';
+
+import bgs, { wallStills } from './wallVideos';
+import { night } from './nightTheme';
+
+/**
+ * 壁纸视频背景（创意工坊那张壁纸的手机版 MP4）。
+ *
+ * 用户要的："画面一定给我套进去"。工坊目录里的 scene.pkg 是 320MB 的 WE 专有场景包，
+ * 没有解码器用不了；但作者另发了手机/平板版 MP4 —— 那两个才是能直接播的画面，
+ * 所以这里用 expo-video 做「静音 + 循环 + cover 满屏」背景，上面压一层暗色保证文字可读。
+ *
+ * 兜底：视频起不来（老机型/解码失败/用户关了动效）就不渲染，交给下层纯代码夜景，绝不黑屏。
+ */
+export function WallVideo({
+  which = 0,
+  enabled = true,
+  style,
+}: {
+  /** 0 = 直播页那张，1 = 影院页那张 */
+  which?: 0 | 1 | 2;
+  enabled?: boolean;
+  style?: StyleProp<ViewStyle>;
+}) {
+  const [ok, setOk] = useState(true);
+  const source = bgs[which] ?? bgs[0];
+
+  const player = useVideoPlayer(source, (p) => {
+    p.muted = true;
+    p.loop = true;
+    p.volume = 0;
+    p.play();
+  });
+
+  useEffect(() => {
+    if (!enabled) return;
+    try {
+      player.play();
+    } catch {
+      setOk(false);
+    }
+    return () => {
+      try {
+        player.pause();
+      } catch {
+        /* 忽略 */
+      }
+    };
+  }, [enabled, player]);
+
+  /*
+   * 视频起不来（老机型 / 解码失败 / 用户关了动效）→ 退回**静态高清壁纸**，
+   * 再不行才交给下面纯代码画的夜景（NightSky）。三层兜底，不会黑屏。
+   */
+  if (!enabled) return null;
+  if (!ok) {
+    const still = wallStills[which] ?? wallStills[0];
+    if (!still) return null;
+    return (
+      <View pointerEvents="none" style={[StyleSheet.absoluteFill, { zIndex: 9 }, style]}>
+        <Image source={still} style={StyleSheet.absoluteFill} resizeMode="cover" />
+        <View style={styles.shadeA} />
+        <View style={styles.shadeB} />
+      </View>
+    );
+  }
+
+  return (
+    /*
+     * zIndex 必须抬高：NightBackdrop 里先画的是一层不透明的夜空渐变，
+     * 视频如果按普通顺序插入会被它整个盖住（用户看到的就是"只有个夜景"）。
+     * 抬起 zIndex 之后视频才是真正看得见的背景，上面的星点自然被视频覆盖，
+     * 可读性由视频自带的两层暗色压层保证。
+     */
+    <View pointerEvents="none" style={[StyleSheet.absoluteFill, { zIndex: 9 }, style]}>
+      <VideoView
+        player={player}
+        style={StyleSheet.absoluteFill}
+        contentFit="cover"
+        nativeControls={false}
+      />
+      <View style={styles.shadeA} />
+      <View style={styles.shadeB} />
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  shadeA: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: 'rgba(6,10,26,0.5)',
+  },
+  shadeB: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    bottom: 0,
+    height: 220,
+    backgroundColor: 'rgba(4,7,18,0.45)',
+    opacity: 0.55,
+  },
+});

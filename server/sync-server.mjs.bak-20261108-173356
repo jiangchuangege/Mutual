@@ -1,0 +1,1163 @@
+/**
+ * TwoSpace 同步服务器 v2 —— **账号模型**（零依赖，Node 18+）
+ *
+ * 为什么重写：v1 让服务端给每台手机分配「A 端 / B 端」，于是所有问题都围绕
+ * "谁是 A、谁是 B"打转：两台手机都被分到 B、一个端上留着别人的档案、
+ * 自己跟自己绑定……用户说得对：**账号不一样，就是不同的账户**，
+ * 端这种东西本来就不该出现在产品里。
+ *
+ * v2 的规则：
+ *   1. 每个人注册一个**账号**（账号 ID 唯一，形如 TW8K3M9Q），带 6 位登录码
+ *   2. 一台手机登录一个账号；换手机用「账号 ID + 登录码」登录，数据跟着账号走
+ *   3. 每个账号一开始有自己的**个人空间**；两个账号互相确认绑定后，合并成一个**双人空间**
+ *   4. 服务端用 token 认人：token → 账号 → 空间 + 内部槽位（A/B 只是内部槽位，界面永不显示）
+ *   5. 严格隔离：没有 token 拿不到任何数据；别的账号的空间你连"存在"都看不到
+ *
+ * 接口：
+ *   GET  /ping                                       连通性探测
+ *   GET  /health                                     只给计数，不含任何个人信息
+ *   POST /api/account/create {name,birthDate,gender,avatarUri,pin,deviceId}
+ *   POST /api/account/login  {accountId,pin,deviceId}
+ *   GET  /api/account/me                             (Bearer token) 账号 + 对方 + 绑定状态
+ *   POST /api/rpc            {method,args}           (Bearer token)
+ *   GET  /api/wait?rev=N                             (Bearer token) 长轮询
+ *   POST /api/pair/request   {targetId}              (Bearer token) 搜索账号 ID 发请求
+ *   POST /api/pair/accept                            (Bearer token)
+ *   POST /api/pair/decline                           (Bearer token)
+ *   POST /api/pair/reset                             (Bearer token) 解绑并各自清空，重新开始
+ *   POST /api/restore        {state}                 (Bearer token) 空间为空时用本机数据重建
+ *
+ * 环境变量：
+ *   PORT=8787  HOST=0.0.0.0  DATA_FILE=server/data/space.json
+ *   TWOSPACE_NO_LISTEN=1   只加载领域逻辑、不监听端口（测试用）
+ */
+
+import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import { createRequire } from 'node:module';
+import { fileURLToPath } from 'node:url';
+
+import { createWebSocketLayer } from './wsCore.mjs';
+
+const require = createRequire(import.meta.url);
+const { Hub } = require('../dist-core/hub.js');
+
+const PORT = Number(process.env.PORT ?? 8787);
+const HOST = process.env.HOST ?? '0.0.0.0';
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const DATA_FILE = process.env.DATA_FILE ?? path.join(HERE, 'data', 'space.json');
+const startedAt = Date.now();
+
+/** 账号 ID 字符集：去掉了容易看错的 0/1/I/O */
+const ID_CHARS = '23456789ABCDEFGHJKMNPQRSTUVWXYZ';
+
+function randomId(prefix = 'TW') {
+  let out = '';
+  const bytes = crypto.randomBytes(6);
+  for (let i = 0; i < 6; i += 1) out += ID_CHARS[bytes[i] % ID_CHARS.length];
+  return `${prefix}${out}`;
+}
+
+function normalizeAccountId(raw) {
+  return String(raw ?? '')
+    .replace(/[\s-]/g, '')
+    .toUpperCase()
+    .slice(0, 12);
+}
+
+function hashPin(pin, accountId) {
+  // 简单但足够：登录码只用于"另一台手机登录同一个账号"，加账号 ID 当盐
+  return crypto.createHash('sha256').update(`${accountId}:${pin}`).digest('hex');
+}
+
+function newToken() {
+  return crypto.randomBytes(24).toString('hex');
+}
+
+// ---------------------------------------------------------------------------
+// 数据（accounts / pairs / sessions），落盘见 saveNow()
+// ---------------------------------------------------------------------------
+
+/**
+ * @type {{
+ *   version: number,
+ *   accounts: Record<string, {
+ *     id: string, name: string, gender: string, birthDate: string, avatarUri: string|null,
+ *     pinHash: string, createdAt: number, lastSeenAt: number, pairId: string,
+ *   }>,
+ *   pairs: Record<string, {
+ *     id: string, a: string, b: string|null, createdAt: number, boundAt: number|null,
+ *     pending: {accountId: string, at: number}|null,
+ *     state: object|null,
+ *   }>,
+ *   sessions: Record<string, {accountId: string, createdAt: number}>,
+ * }}
+ */
+const db = {
+  version: 2,
+  accounts: {},
+  pairs: {},
+  sessions: {},
+};
+
+/** 每个双人空间一份 Hub（密钥是 pairId） */
+const hubs = new Map();
+/** 登录失败次数：防暴力猜登录码 */
+const loginFails = new Map();
+/** 全局版本号：任何空间变化都 +1，客户端据此判断"要不要收这份快照" */
+let revision = 0;
+/**
+ * 重启后的版本号下限。
+ *
+ * 为什么要有：客户端用 `rev < 我见过的最大 rev 就丢弃` 来防旧快照，
+ * 而这个计数以前每次重启都从 0 重新数 —— 手机端已经见过 25，
+ * 服务端重启后又从 0 开始，于是**后面所有快照都被客户端当成旧的丢掉**，
+ * 表现就是"右上角一直绿着已连接，但怎么点都不同步"。
+ * 给一个足够大的起步值，配合落盘持久化，就能保证序号永远只增不减。
+ */
+const REVISION_FLOOR = 1_000_000;
+/** 长轮询等待者 */
+const waiters = new Set();
+/** WS 层（后面创建） */
+let ws = null;
+
+function bump() {
+  revision += 1;
+  for (const waiter of [...waiters]) waiter();
+  // 长连接也要立刻推一份新投影，否则手机上要等下一次操作才看得到变化。
+  // （每个连接推的是它自己那个账号的投影，跨空间不会串数据）
+  try {
+    ws?.broadcast?.();
+  } catch {
+    // 广播失败不影响状态本身
+  }
+  scheduleSave();
+}
+
+function newHub() {
+  const hub = new Hub({ scale: 1, latencyMs: 0, clockSkew: { A: 0, B: 0 } });
+  hub.subscribe('A', bump);
+  hub.subscribe('B', bump);
+  return hub;
+}
+
+function hubOf(pairId) {
+  let hub = hubs.get(pairId);
+  if (!hub) {
+    hub = newHub();
+    hubs.set(pairId, hub);
+  }
+  return hub;
+}
+
+/** 这个账号在它的空间里是哪个内部槽位（A=创建者，B=后来绑定进来的） */
+function roleOf(accountId) {
+  const account = db.accounts[accountId];
+  if (!account) return null;
+  const pair = db.pairs[account.pairId];
+  if (!pair) return null;
+  if (pair.a === accountId) return 'A';
+  if (pair.b === accountId) return 'B';
+  return null;
+}
+
+function pairOf(accountId) {
+  const account = db.accounts[accountId];
+  return account ? db.pairs[account.pairId] ?? null : null;
+}
+
+function otherAccountId(accountId) {
+  const pair = pairOf(accountId);
+  if (!pair) return null;
+  if (pair.a === accountId) return pair.b;
+  if (pair.b === accountId) return pair.a;
+  return null;
+}
+
+/** 账号的档案写进自己的槽位（账号记录是档案的权威来源） */
+function seedProfile(pairId, role, account) {
+  const hub = hubOf(pairId);
+  hub.updateMyProfile(role, {
+    name: account.name,
+    birthDate: account.birthDate,
+    gender: account.gender,
+  });
+  if (account.avatarUri) hub.setMyAvatar(role, account.avatarUri);
+  // 空间里那个人的固定 ID = 账号 ID：一处身份，不用记两个
+  try {
+    hub.adoptPublicId(role, account.id);
+  } catch {
+    // 老版本 core 没有这个方法时忽略（不影响绑定）
+  }
+}
+
+/** 新建一个"个人空间"（只有自己，还没绑定） */
+function createSoloPair(accountId) {
+  const pairId = `pair_${accountId}`;
+  db.pairs[pairId] = {
+    id: pairId,
+    a: accountId,
+    b: null,
+    createdAt: Date.now(),
+    boundAt: null,
+    pending: null,
+    state: null,
+  };
+  db.accounts[accountId].pairId = pairId;
+  hubs.delete(pairId);
+  seedProfile(pairId, 'A', db.accounts[accountId]);
+  return pairId;
+}
+
+// ---------------------------------------------------------------------------
+// 持久化
+// ---------------------------------------------------------------------------
+
+function serializePair(pair) {
+  return { ...pair, state: hubs.has(pair.id) ? hubOf(pair.id).serialize() : pair.state };
+}
+
+let saveTimer = null;
+function scheduleSave() {
+  if (saveTimer) return;
+  saveTimer = setTimeout(() => {
+    saveTimer = null;
+    saveNow();
+  }, 400);
+}
+
+function saveNow() {
+  try {
+    fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
+    const pairs = {};
+    for (const [id, pair] of Object.entries(db.pairs)) pairs[id] = serializePair(pair);
+    const payload = JSON.stringify(
+      {
+        savedAt: Date.now(),
+        version: 2,
+        // 版本号也要落盘：它重启后归零的话，已经连过的手机就会把新快照当成"旧的"丢掉
+        revision,
+        accounts: db.accounts,
+        pairs,
+        sessions: db.sessions,
+      },
+      null,
+      0,
+    );
+    const tmp = `${DATA_FILE}.tmp`;
+    fs.writeFileSync(tmp, payload, 'utf8');
+    fs.renameSync(tmp, DATA_FILE);
+  } catch (err) {
+    console.warn(`[twospace] 存档失败：${err instanceof Error ? err.message : err}`);
+  }
+}
+
+function loadPersisted() {
+  try {
+    if (!fs.existsSync(DATA_FILE)) return false;
+    const raw = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+
+    // v1 存档（单个空间 + roleOwnerId）：**不迁移**。
+    // 它是"服务端分配 A/B 端"时代的产物，身份本来就是错的，硬迁会把错误带过来。
+    // 保留文件、以空账号库启动，用户重新注册一次即可（账号模型下这一步很轻）。
+    if (!raw || raw.version !== 2 || !raw.accounts) {
+      console.log('[twospace] 检测到旧版存档（v1 端分配模型），已跳过，按空账号库启动');
+      return false;
+    }
+
+    db.accounts = raw.accounts ?? {};
+    db.pairs = raw.pairs ?? {};
+    db.sessions = raw.sessions ?? {};
+    // 版本号接着上次的数往下走（只增不减），否则重启后客户端会丢快照。
+    // 另外给一个**很大的起步值**：老客户端可能已经见过几千号，从 0 重新数会让
+    // 它把新快照当成"旧的"静默丢掉。revision 对客户端只是一个不透明序号，
+    // 跳大没有任何副作用，只用来保证"后写的永远比先写的大"。
+    const persisted = typeof raw.revision === 'number' ? raw.revision : 0;
+    revision = Math.max(revision, persisted, REVISION_FLOOR);
+    for (const [pairId, pair] of Object.entries(db.pairs)) {
+      const hub = newHub();
+      if (pair.state) hub.hydrate(pair.state);
+      hubs.set(pairId, hub);
+    }
+    console.log(
+      `[twospace] 已恢复 ${Object.keys(db.accounts).length} 个账号 / ${Object.keys(db.pairs).length} 个空间（rev=${revision}）`,
+    );
+    return true;
+  } catch (err) {
+    console.warn(`[twospace] 读取存档失败，按空账号库启动：${err instanceof Error ? err.message : err}`);
+    return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 账号 API（领域逻辑，HTTP 和测试共用）
+// ---------------------------------------------------------------------------
+
+function fail(error) {
+  return { ok: false, error };
+}
+
+function ok(value = null) {
+  return { ok: true, value };
+}
+
+function validProfile(input) {
+  const name = String(input?.name ?? '').trim().slice(0, 20);
+  const birthDate = String(input?.birthDate ?? '').trim();
+  const gender = input?.gender === 'male' || input?.gender === 'female' ? input.gender : 'other';
+  if (!name) return { error: '昵称不能为空' };
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(birthDate)) return { error: '生日格式应为 YYYY-MM-DD' };
+  return { name, birthDate, gender };
+}
+
+function createAccount(input) {
+  const profile = validProfile(input);
+  if (profile.error) return fail(profile.error);
+  const pin = String(input?.pin ?? '').trim();
+  if (!/^\d{6}$/.test(pin)) return fail('登录码必须是 6 位数字');
+
+  // 账号 ID 唯一（理论上碰撞概率极低，仍然检查）
+  let accountId = randomId('TW');
+  for (let i = 0; i < 12 && db.accounts[accountId]; i += 1) accountId = randomId('TW');
+
+  db.accounts[accountId] = {
+    id: accountId,
+    name: profile.name,
+    gender: profile.gender,
+    birthDate: profile.birthDate,
+    avatarUri: typeof input?.avatarUri === 'string' ? input.avatarUri : null,
+    pinHash: hashPin(pin, accountId),
+    createdAt: Date.now(),
+    lastSeenAt: Date.now(),
+    pairId: '',
+  };
+  const pairId = createSoloPair(accountId);
+  // 空间里那个人的固定 ID 就是账号 ID：一处身份，不用记两个
+  const token = newToken();
+  db.sessions[token] = { accountId, createdAt: Date.now() };
+  bump();
+  return ok({ accountId, token, pairId, role: 'A', bound: false });
+}
+
+function login(input) {
+  const accountId = normalizeAccountId(input?.accountId);
+  const pin = String(input?.pin ?? '').trim();
+  if (!accountId) return fail('请输入账号 ID');
+  if (!/^\d{6}$/.test(pin)) return fail('请输入 6 位登录码');
+  const account = db.accounts[accountId];
+  if (!account) return fail('没有这个账号，检查一下账号 ID');
+
+  const fails = loginFails.get(accountId) ?? { count: 0, until: 0 };
+  if (fails.until > Date.now()) {
+    const sec = Math.ceil((fails.until - Date.now()) / 1000);
+    return fail(`登录码连续输错，请 ${sec} 秒后再试`);
+  }
+  if (account.pinHash !== hashPin(pin, accountId)) {
+    const count = fails.count + 1;
+    loginFails.set(accountId, { count, until: count >= 5 ? Date.now() + 60_000 : 0 });
+    return fail(count >= 5 ? '登录码连续输错 5 次，请 1 分钟后再试' : '登录码不对');
+  }
+  loginFails.delete(accountId);
+  account.lastSeenAt = Date.now();
+  const token = newToken();
+  db.sessions[token] = { accountId, createdAt: Date.now() };
+  const role = roleOf(accountId);
+  const pair = pairOf(accountId);
+  bump();
+  return ok({ accountId, token, pairId: account.pairId, role, bound: Boolean(pair?.boundAt) });
+}
+
+function accountOfToken(token) {
+  if (!token) return null;
+  const session = db.sessions[token];
+  if (!session) return null;
+  const account = db.accounts[session.accountId];
+  if (!account) return null;
+  account.lastSeenAt = Date.now();
+  return account;
+}
+
+function me(accountId) {
+  const account = db.accounts[accountId];
+  if (!account) return fail('账号不存在');
+  const pair = pairOf(accountId);
+  const partnerId = otherAccountId(accountId);
+  const partner = partnerId ? db.accounts[partnerId] : null;
+  const role = roleOf(accountId);
+  const hub = hubOf(account.pairId);
+  const snap = hub.snapshot(role);
+  return ok({
+    account: {
+      id: account.id,
+      name: account.name,
+      gender: account.gender,
+      birthDate: account.birthDate,
+      avatarUri: account.avatarUri,
+      role,
+    },
+    pair: {
+      id: account.pairId,
+      bound: Boolean(pair?.boundAt),
+      boundAt: pair?.boundAt ?? null,
+      pending: pair?.pending ? { fromName: db.accounts[pair.pending.accountId]?.name ?? '', at: pair.pending.at } : null,
+    },
+    partner: partner
+      ? {
+          id: partner.id,
+          name: partner.name,
+          // 只有绑定之后才把对方的资料给出去
+          gender: pair?.boundAt ? snap.members[role === 'A' ? 'B' : 'A'].gender : null,
+          publicId: partner.id,
+        }
+      : null,
+    rev: revision,
+  });
+}
+
+/** 搜对方账号 ID 发绑定请求（不泄露对方任何档案内容，只说"存在/不存在"） */
+function requestBind(accountId, rawTargetId) {
+  const meAccount = db.accounts[accountId];
+  if (!meAccount) return fail('账号不存在');
+  const myPair = pairOf(accountId);
+  if (myPair?.b) return fail('你已经在双人空间里了，需要先解绑');
+
+  const targetId = normalizeAccountId(rawTargetId);
+  if (!targetId) return fail('请输入对方的账号 ID');
+  if (targetId === accountId) return fail('这是你自己的账号 ID，填对方的');
+  const target = db.accounts[targetId];
+  if (!target) return fail(`没找到账号 ${targetId}，让对方在「我们」页确认一下他的账号 ID`);
+  const targetPair = pairOf(targetId);
+  if (!targetPair) return fail('对方的空间还没准备好，请稍后再试');
+  if (targetPair.b) return fail('对方已经在双人空间里了');
+
+  // 对方之前已经请求过我 → 双向确认，直接绑定
+  if (myPair?.pending && myPair.pending.accountId === targetId) {
+    return acceptBind(accountId);
+  }
+  // 我已经请求过对方，重复点一次不算错
+  if (targetPair.pending && targetPair.pending.accountId === accountId) {
+    return ok({ paired: false });
+  }
+  targetPair.pending = { accountId, at: Date.now() };
+  bump();
+  return ok({ paired: false });
+}
+
+/**
+ * 同意绑定：把两个账号并进同一个双人空间。
+ *
+ * 目标空间是**对方的个人空间**（对方是创建者 → 内部槽位 A），
+ * 我作为 B 并进去：我的档案写进 B 槽，我原来的个人空间作废。
+ */
+function acceptBind(accountId) {
+  const myPair = pairOf(accountId);
+  if (!myPair) return fail('账号不存在');
+  if (myPair.b) return fail('你已经在双人空间里了');
+
+  // 谁是我要绑的人
+  let otherId = null;
+  if (myPair.pending && myPair.pending.accountId !== accountId) {
+    otherId = myPair.pending.accountId;
+  }
+  if (!otherId) {
+    // 我没有待处理请求：看看是不是"我请求过别人、对方现在同意了"
+    for (const pair of Object.values(db.pairs)) {
+      if (pair.pending && pair.pending.accountId === accountId && pair.a !== accountId) {
+        otherId = pair.a;
+        break;
+      }
+    }
+  }
+  if (!otherId) return fail('没有待确认的绑定请求');
+  const other = db.accounts[otherId];
+  if (!other) return fail('对方的账号已经不存在了');
+  const targetPair = pairOf(otherId);
+  if (!targetPair || targetPair.b) return fail('对方已经在别的双人空间里了');
+  if (targetPair.id === myPair.id) return fail('你们已经在同一个空间里了');
+
+  // 我的档案并进对方的空间（B 槽）；对方的档案本来就已在 A 槽
+  seedProfile(targetPair.id, 'B', db.accounts[accountId]);
+  targetPair.b = accountId;
+  targetPair.pending = null;
+  targetPair.boundAt = Date.now();
+  hubOf(targetPair.id).bindPair('A');
+
+  // 我原来的个人空间作废（里面只有我自己的档案，已经搬到目标空间了）
+  if (myPair.id !== targetPair.id) {
+    delete db.pairs[myPair.id];
+    hubs.delete(myPair.id);
+  }
+  db.accounts[accountId].pairId = targetPair.id;
+  bump();
+  return ok({ paired: true, pairId: targetPair.id });
+}
+
+function declineBind(accountId) {
+  const pair = pairOf(accountId);
+  if (!pair) return fail('账号不存在');
+  if (pair.pending && pair.pending.accountId !== accountId) {
+    pair.pending = null;
+    bump();
+    return ok(null);
+  }
+  // 我请求过别人 → 撤回
+  let cleared = false;
+  for (const p of Object.values(db.pairs)) {
+    if (p.pending && p.pending.accountId === accountId) {
+      p.pending = null;
+      cleared = true;
+    }
+  }
+  if (!cleared) return fail('没有待处理的请求');
+  bump();
+  return ok(null);
+}
+
+/**
+ * 解绑并各自清空（「我们重来一次」）。
+ *
+ * 两个账号都保留（档案还在），空间各自回到"只有自己、未绑定、没有任何数据"。
+ */
+function resetPair(accountId) {
+  const pair = pairOf(accountId);
+  if (!pair) return fail('账号不存在');
+  const oldPairId = pair.id;
+  const members = [pair.a, pair.b].filter((id) => typeof id === 'string' && id);
+
+  // 清空这个空间的全部内容（两个人的档案也一并清掉，账号本身保留）
+  hubOf(oldPairId).resetToEmpty();
+  pair.b = null;
+  pair.boundAt = null;
+  pair.pending = null;
+  for (const id of members) {
+    if (db.accounts[id]) db.accounts[id].pairId = '';
+  }
+  // 每个人回到自己的个人空间（档案来自账号记录，所以不会丢昵称/生日/头像）
+  for (const id of members) {
+    if (db.accounts[id]) createSoloPair(id);
+  }
+  // 旧共享空间如果没人再用就删掉（注意：创建者的个人空间 ID 可能正好复用这个 id，
+  // 那就不能删，否则刚建好的空间立刻消失 —— 踩过）
+  const stillUsed = Object.values(db.accounts).some((acc) => acc.pairId === oldPairId);
+  if (!stillUsed) {
+    delete db.pairs[oldPairId];
+    hubs.delete(oldPairId);
+  }
+  bump();
+  return ok(null);
+}
+
+/** 空间还是空的：允许某一方把本机数据推回来（服务端被清过时用） */
+function restoreState(accountId, state) {
+  if (!state || typeof state.spaceId !== 'string') return fail('缺少有效的空间数据');
+  const pair = pairOf(accountId);
+  if (!pair) return fail('账号不存在');
+  const hub = hubOf(pair.id);
+  const snap = hub.snapshot('A');
+  if (snap.boundAt !== null || snap.members.A.profileCompleted || snap.members.B.profileCompleted) {
+    return fail('服务端已经有数据了，不需要恢复');
+  }
+  if (!hub.hydrate(state)) return fail('这份数据无法恢复（格式不对）');
+  bump();
+  return ok({ bound: hub.snapshot('A').boundAt !== null });
+}
+
+// ---------------------------------------------------------------------------
+// 快照投影：把账号层的"待处理请求"叠进空间快照
+// ---------------------------------------------------------------------------
+
+function stateFor(accountId) {
+  const account = db.accounts[accountId];
+  if (!account) return null;
+  const role = roleOf(accountId);
+  if (!role) return null;
+  const pair = pairOf(accountId);
+  const hub = hubOf(account.pairId);
+  let snap;
+  try {
+    snap = hub.snapshot(role);
+  } catch {
+    return null;
+  }
+  const pending = pair?.pending ?? null;
+  if (pending && !pair?.b) {
+    const other = db.accounts[pending.accountId];
+    if (pending.accountId === accountId) {
+      // 我发出去的请求：等我这边确认（界面显示"已发出"）
+      snap.bindRequest = { fromRole: role, at: pending.at };
+    } else if (other) {
+      snap.bindRequest = {
+        fromRole: role === 'A' ? 'B' : 'A',
+        at: pending.at,
+        fromName: other.name,
+        fromPublicId: other.id,
+      };
+    }
+  } else {
+    // 我发出去的请求其实记在**对方**的空间上：这里反查一次，
+    // 否则请求方界面永远看不到"已发出，等 TA 确认"。
+    let outgoing = null;
+    for (const p of Object.values(db.pairs)) {
+      if (p.pending && p.pending.accountId === accountId && p.a !== accountId) {
+        outgoing = p.pending;
+        break;
+      }
+    }
+    snap.bindRequest = outgoing ? { fromRole: role, at: outgoing.at } : null;
+  }
+  return snap;
+}
+
+// ---------------------------------------------------------------------------
+// HTTP
+// ---------------------------------------------------------------------------
+
+function readBody(req) {
+  return new Promise((resolve) => {
+    let raw = '';
+    req.on('data', (chunk) => {
+      raw += chunk;
+      if (raw.length > 4 * 1024 * 1024) req.destroy();
+    });
+    req.on('end', () => {
+      try {
+        resolve(raw ? JSON.parse(raw) : {});
+      } catch {
+        resolve({});
+      }
+    });
+    req.on('error', () => resolve({}));
+  });
+}
+
+function json(res, status, payload) {
+  const body = JSON.stringify(payload);
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'access-control-allow-origin': '*',
+    'access-control-allow-headers': 'content-type, authorization',
+    'access-control-allow-methods': 'GET,POST,OPTIONS',
+    'cache-control': 'no-store',
+    'content-length': Buffer.byteLength(body),
+  });
+  res.end(body);
+}
+
+// ---------------------------------------------------------------------------
+// 上传（头像 / 空间背景图）
+//
+// 以前这两样存的都是**手机本地的 file:// 路径**：
+//   1. 另一个人的手机根本打不开那个路径（换机就更没了）；
+//   2. 头像那个字段甚至连渲染都没有。
+// 现在统一"上传到这台服务器"，状态里只放一个相对路径
+// （`/avatar/xxx.jpg`、`/background/xxx.jpg`），两台手机都从同一台服务器取图。
+// ---------------------------------------------------------------------------
+
+/** kind → 目录 + URL 前缀。头像/背景/照片/音乐分开存，方便分别清理 */
+const UPLOAD_KINDS = {
+  avatar: { dir: 'avatars', prefix: '/avatar/' },
+  background: { dir: 'backgrounds', prefix: '/background/' },
+  photo: { dir: 'photos', prefix: '/photo/' },
+  // 本地音乐：用户在自己手机上选的文件，传到服务器后对方也能"一起听"
+  audio: { dir: 'audio', prefix: '/audio/' },
+};
+/** 一张图的上限：3MB base64（≈2.2MB 原图，够清楚了） */
+const UPLOAD_MAX_B64 = 3 * 1024 * 1024;
+/** 一首歌的上限：24MB base64（≈18MB 音频，普通 mp3 一首 4–10MB 足够） */
+const AUDIO_MAX_B64 = 24 * 1024 * 1024;
+const IMAGE_EXT = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', webp: 'image/webp' };
+/** 音频扩展名 → MIME（Android 播放器靠它选解码器） */
+const AUDIO_EXT = {
+  mp3: 'audio/mpeg',
+  m4a: 'audio/mp4',
+  aac: 'audio/aac',
+  wav: 'audio/wav',
+  ogg: 'audio/ogg',
+  flac: 'audio/flac',
+  opus: 'audio/opus',
+};
+
+function uploadDir(kind) {
+  return path.join(path.dirname(DATA_FILE), UPLOAD_KINDS[kind].dir);
+}
+
+function saveUpload(kind, accountId, data, extRaw) {
+  if (!UPLOAD_KINDS[kind]) return { ok: false, error: '未知的上传类型' };
+  const isAudio = kind === 'audio';
+  const maxB64 = isAudio ? AUDIO_MAX_B64 : UPLOAD_MAX_B64;
+  if (typeof data !== 'string' || data.length < 64) {
+    return { ok: false, error: isAudio ? '没有收到音频数据' : '没有收到图片数据' };
+  }
+  if (data.length > maxB64) {
+    return {
+      ok: false,
+      error: isAudio ? '这首歌太大了（上限约 18MB），换一首小一点的' : '图片太大了，换一张小一点的',
+    };
+  }
+  const clean = isAudio
+    ? data.replace(/^data:audio\/[a-z0-9.+-]+;base64,/i, '').replace(/\s/g, '')
+    : data.replace(/^data:image\/[a-z]+;base64,/i, '').replace(/\s/g, '');
+  let buf;
+  try {
+    buf = Buffer.from(clean, 'base64');
+  } catch {
+    return { ok: false, error: isAudio ? '音频数据不合法' : '图片数据不合法' };
+  }
+  if (buf.length < 32) return { ok: false, error: isAudio ? '音频数据不合法' : '图片数据不合法' };
+  const extRawLower = typeof extRaw === 'string' ? extRaw.toLowerCase() : '';
+  const table = isAudio ? AUDIO_EXT : IMAGE_EXT;
+  const fallback = isAudio ? 'mp3' : 'jpg';
+  const ext = table[extRawLower] ? extRawLower : fallback;
+  const name = `${accountId}-${Date.now().toString(36)}.${ext}`;
+  const dir = uploadDir(kind);
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    // 头像/背景换图就删旧文件；照片可能有很多张，保留历史；
+    // 音乐保留历史（一起听列表里可能还有别的歌在引用旧文件）
+    if (kind !== 'photo' && !isAudio) for (const old of fs.readdirSync(dir)) {
+      if (old.startsWith(`${accountId}-`)) {
+        try {
+          fs.unlinkSync(path.join(dir, old));
+        } catch {
+          // 删不掉就算了
+        }
+      }
+    }
+    fs.writeFileSync(path.join(dir, name), buf);
+  } catch (err) {
+    return { ok: false, error: `保存图片失败：${err instanceof Error ? err.message : String(err)}` };
+  }
+  console.log(`[${kind}] 账号=${accountId} 大小=${Math.round(buf.length / 1024)}KB 文件=${name}`);
+  return { ok: true, value: { path: `${UPLOAD_KINDS[kind].prefix}${name}`, bytes: buf.length } };
+}
+
+function serveUpload(kind, name, res) {
+  const meta = UPLOAD_KINDS[kind];
+  const safe = String(name).replace(/[^A-Za-z0-9._-]/g, '');
+  const ext = (safe.split('.').pop() ?? '').toLowerCase();
+  const type = kind === 'audio' ? AUDIO_EXT[ext] : IMAGE_EXT[ext];
+  const notFound = () => {
+    res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
+    res.end('not found');
+  };
+  if (!meta || !safe || !type) {
+    notFound();
+    return;
+  }
+  let buf;
+  try {
+    buf = fs.readFileSync(path.join(uploadDir(kind), safe));
+  } catch {
+    notFound();
+    return;
+  }
+  res.writeHead(200, {
+    'content-type': type,
+    'content-length': buf.length,
+    // 文件名带时间戳，内容不会变：让手机自己缓存，别每次进首页都重新下
+    'cache-control': 'public, max-age=31536000, immutable',
+    'access-control-allow-origin': '*',
+  });
+  res.end(buf);
+}
+
+function tokenFrom(req, url, body) {  const header = req.headers.authorization;
+  if (typeof header === 'string' && header.toLowerCase().startsWith('bearer ')) {
+    return header.slice(7).trim();
+  }
+  if (typeof body?.token === 'string' && body.token) return body.token;
+  const q = url.searchParams.get('token');
+  return q ?? '';
+}
+
+/** 需要登录的接口：token → accountId，拿不到就 401 */
+function requireAccount(req, res, url, body) {
+  const token = tokenFrom(req, url, body);
+  const account = accountOfToken(token);
+  if (!account) {
+    json(res, 401, { ok: false, code: 'auth', error: '登录状态已失效，请重新登录（账号 ID + 登录码）' });
+    return null;
+  }
+  return account;
+}
+
+async function handle(req, res) {
+  const url = new URL(req.url ?? '/', `http://localhost:${PORT}`);
+
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, {
+      'access-control-allow-origin': '*',
+      'access-control-allow-headers': 'content-type, authorization',
+      'access-control-allow-methods': 'GET,POST,OPTIONS',
+      'access-control-max-age': '86400',
+    });
+    res.end();
+    return;
+  }
+
+  if (url.pathname === '/ping') {
+    json(res, 200, {
+      ok: true,
+      pong: true,
+      service: 'twospace-sync',
+      version: 2,
+      model: 'account',
+      rev: revision,
+      uptimeSec: Math.round((Date.now() - startedAt) / 1000),
+      ts: Date.now(),
+    });
+    return;
+  }
+
+  // 健康检查**不含任何个人信息**：谁能连上这个端口都能看到，不能泄露账号
+  if (url.pathname === '/health') {
+    const pairs = Object.values(db.pairs);
+    json(res, 200, {
+      ok: true,
+      version: 2,
+      model: 'account',
+      rev: revision,
+      accounts: Object.keys(db.accounts).length,
+      pairs: pairs.length,
+      boundPairs: pairs.filter((p) => p.b).length,
+      uptimeSec: Math.round((Date.now() - startedAt) / 1000),
+    });
+    return;
+  }
+
+  if (url.pathname === '/api/account/create' && req.method === 'POST') {
+    const body = await readBody(req);
+    const res0 = createAccount(body);
+    if (!res0.ok) {
+      json(res, 400, res0);
+      return;
+    }
+    saveNow();
+    json(res, 200, res0);
+    return;
+  }
+
+  if (url.pathname === '/api/account/login' && req.method === 'POST') {
+    const body = await readBody(req);
+    const result = login(body);
+    if (!result.ok) {
+      json(res, 400, result);
+      return;
+    }
+    saveNow();
+    json(res, 200, result);
+    return;
+  }
+
+  if (url.pathname === '/api/account/me') {
+    const body = req.method === 'POST' ? await readBody(req) : {};
+    const account = requireAccount(req, res, url, body);
+    if (!account) return;
+    json(res, 200, me(account.id));
+    return;
+  }
+
+  if (url.pathname === '/api/pair/request' && req.method === 'POST') {
+    const body = await readBody(req);
+    const account = requireAccount(req, res, url, body);
+    if (!account) return;
+    const result = requestBind(account.id, body.targetId);
+    json(res, result.ok ? 200 : 400, result);
+    return;
+  }
+
+  if (url.pathname === '/api/pair/accept' && req.method === 'POST') {
+    const body = await readBody(req);
+    const account = requireAccount(req, res, url, body);
+    if (!account) return;
+    const result = acceptBind(account.id);
+    json(res, result.ok ? 200 : 400, result);
+    return;
+  }
+
+  if (url.pathname === '/api/pair/decline' && req.method === 'POST') {
+    const body = await readBody(req);
+    const account = requireAccount(req, res, url, body);
+    if (!account) return;
+    const result = declineBind(account.id);
+    json(res, result.ok ? 200 : 400, result);
+    return;
+  }
+
+  if (url.pathname === '/api/pair/reset' && req.method === 'POST') {
+    const body = await readBody(req);
+    const account = requireAccount(req, res, url, body);
+    if (!account) return;
+    const result = resetPair(account.id);
+    json(res, result.ok ? 200 : 400, result);
+    return;
+  }
+
+  if (url.pathname === '/api/avatar' && req.method === 'POST') {
+    const body = await readBody(req);
+    const account = requireAccount(req, res, url, body);
+    if (!account) return;
+    const result = saveUpload('avatar', account.id, body.data, body.ext);
+    json(res, result.ok ? 200 : 400, result);
+    return;
+  }
+
+  if (url.pathname === '/api/upload' && req.method === 'POST') {
+    const body = await readBody(req);
+    const account = requireAccount(req, res, url, body);
+    if (!account) return;
+    const kind = String(body.kind ?? 'avatar');
+    const result = saveUpload(kind, account.id, body.data, body.ext);
+    json(res, result.ok ? 200 : 400, result);
+    return;
+  }
+
+  if (url.pathname.startsWith('/avatar/') && req.method === 'GET') {
+    serveUpload('avatar', url.pathname.slice('/avatar/'.length), res);
+    return;
+  }
+
+  // 本地音乐：对方的播放器直接从这里取
+  if (url.pathname.startsWith('/audio/') && req.method === 'GET') {
+    serveUpload('audio', url.pathname.slice('/audio/'.length), res);
+    return;
+  }
+
+  if (url.pathname.startsWith('/background/') && req.method === 'GET') {
+    serveUpload('background', url.pathname.slice('/background/'.length), res);
+    return;
+  }
+
+  if (url.pathname.startsWith('/photo/') && req.method === 'GET') {
+    serveUpload('photo', url.pathname.slice('/photo/'.length), res);
+    return;
+  }
+
+  if (url.pathname === '/api/restore' && req.method === 'POST') {
+    const body = await readBody(req);
+    const account = requireAccount(req, res, url, body);
+    if (!account) return;
+    const result = restoreState(account.id, body.state);
+    json(res, result.ok ? 200 : 400, result);
+    return;
+  }
+
+  if (url.pathname === '/api/rpc' && req.method === 'POST') {
+    const body = await readBody(req);
+    const account = requireAccount(req, res, url, body);
+    if (!account) return;
+    const result = runRpc(account.id, String(body.method ?? ''), Array.isArray(body.args) ? body.args : []);
+    json(res, result.ok ? 200 : 400, result);
+    return;
+  }
+
+  if (url.pathname === '/api/wait') {
+    const body = req.method === 'POST' ? await readBody(req) : {};
+    const account = requireAccount(req, res, url, body);
+    if (!account) return;
+    const since = Number(url.searchParams.get('rev') ?? -1);
+    const reply = () => {
+      const state = stateFor(account.id);
+      if (!state) {
+        json(res, 400, { ok: false, error: '空间不可用' });
+        return;
+      }
+      // role 一起下发：绑定之后账号的槽位会从 A 变成 B，
+      // 客户端必须每次都拿到最新槽位，否则会把对方的数据当成自己的。
+      json(res, 200, { ok: true, rev: revision, role: roleOf(account.id), state });
+    };
+    if (since !== revision) {
+      reply();
+      return;
+    }
+    let done = false;
+    const timer = setTimeout(() => {
+      if (done) return;
+      done = true;
+      waiters.delete(waiter);
+      reply();
+    }, 20_000);
+    const waiter = () => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      waiters.delete(waiter);
+      reply();
+    };
+    waiters.add(waiter);
+    req.on('close', () => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      waiters.delete(waiter);
+    });
+    return;
+  }
+
+  json(res, 404, { ok: false, error: 'not found' });
+}
+
+// ---------------------------------------------------------------------------
+// RPC：业务方法仍然跑在 Hub 上（空间内部槽位由 token 解析，客户端不传 role）
+// ---------------------------------------------------------------------------
+
+/** 绝对不能从网上调用的方法 */
+const FORBIDDEN = new Set([
+  'constructor',
+  'hydrate',
+  'serialize',
+  'resetToEmpty',
+  'hydrateProjected',
+  'requestBind',
+  'acceptBind',
+  'declineBind',
+  'bindPair',
+  'createInvite',
+  'regenerateInvite',
+  'extendInvite',
+  'joinWithCode',
+  'clearMemberProfile',
+  'fastForwardCooling',
+]);
+
+function runRpc(accountId, method, args) {
+  const account = db.accounts[accountId];
+  if (!account) return fail('账号不存在');
+  const role = roleOf(accountId);
+  if (!role) return fail('账号还没有空间');
+  if (!method || FORBIDDEN.has(method) || typeof hubOf(account.pairId)[method] !== 'function') {
+    return fail(`不允许的方法：${method}`);
+  }
+  const hub = hubOf(account.pairId);
+  try {
+    const result = hub[method](role, ...args) ?? ok(null);
+
+    // 档案类写操作：账号记录才是档案的权威来源，这里同步回去
+    if (result.ok && (method === 'updateMyProfile' || method === 'setMyAvatar')) {
+      const snap = hub.snapshot(role);
+      const mine = snap.members[role];
+      account.name = mine.name || account.name;
+      if (mine.gender) account.gender = mine.gender;
+      if (mine.birthDate) account.birthDate = mine.birthDate;
+      account.avatarUri = mine.avatarUri ?? account.avatarUri;
+    }
+    // 每个写操作都留一行日志：同步出问题时，先看服务端到底有没有收到、有没有生效
+    console.log(
+      `[rpc] 账号=${accountId} 空间=${account.pairId} 方法=${method} ` +
+        `${result.ok ? 'ok' : `失败(${result.error})`} rev=${revision}`,
+    );
+    return result;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.log(`[rpc] 账号=${accountId} 方法=${method} 抛异常: ${msg}`);
+    return fail(msg);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket：hello 带 token，服务端认账号
+// ---------------------------------------------------------------------------
+
+ws = createWebSocketLayer({
+  revision: () => revision,
+  stateFor: (client) => (client.accountId ? stateFor(client.accountId) : null),
+  takeRole: (client, msg) => {
+    const token = typeof msg?.token === 'string' ? msg.token : '';
+    const account = accountOfToken(token);
+    if (!account) {
+      client.authError = '登录状态已失效，请重新登录';
+      return null;
+    }
+    client.accountId = account.id;
+    client.pairId = account.pairId;
+    const role = roleOf(account.id);
+    if (!role) {
+      client.authError = '账号还没有空间';
+      return null;
+    }
+    return role;
+  },
+  onHello: (client) => {
+    if (!client.accountId) return;
+    client.pairId = db.accounts[client.accountId]?.pairId ?? null;
+    // 绑定/解绑会改变账号在空间里的槽位，所以每次 hello 都重新算一次
+    const role = roleOf(client.accountId);
+    if (role) client.role = role;
+  },
+  // 每次 hello 都重新解析一次角色（绑定之后槽位会变）
+  refreshRole: true,
+  // **每次推送/每次 rpc 都重新解析**：绑定之后同一个连接属于哪一格会变，
+  // 用连接建立时缓存的角色会让客户端把对方当成自己（真实事故，见 README）
+  roleFor: (client) => (client.accountId ? roleOf(client.accountId) : null),
+  onRpc: (client, method, args) => {
+    if (!client.accountId) return fail('请先登录');
+    const result = runRpc(client.accountId, method, args);
+    if (result.ok) bump();
+    return result;
+  },
+});
+
+// ---------------------------------------------------------------------------
+// 启动
+// ---------------------------------------------------------------------------
+
+const server = http.createServer((req, res) => {
+  void handle(req, res).catch((err) => {
+    json(res, 500, { ok: false, error: err instanceof Error ? err.message : String(err) });
+  });
+});
+
+ws.attach(server);
+loadPersisted();
+
+// 每个空间都要自己 tick（邀请码过期、冷静期、在线状态）
+setInterval(() => {
+  for (const hub of hubs.values()) {
+    try {
+      hub.tick();
+    } catch {
+      // 单个空间出错不能影响别的空间
+    }
+  }
+}, 1000).unref?.();
+
+for (const sig of ['SIGINT', 'SIGTERM']) {
+  process.on(sig, () => {
+    saveNow();
+    process.exit(0);
+  });
+}
+
+/** 供测试用：当前全局版本号 */
+function revisionOf() {
+  return revision;
+}
+
+export {
+  db,
+  hubs,
+  createAccount,
+  login,
+  me,
+  requestBind,
+  acceptBind,
+  declineBind,
+  resetPair,
+  restoreState,
+  stateFor,
+  runRpc,
+  accountOfToken,
+  roleOf,
+  saveNow,
+  loadPersisted,
+  revisionOf,
+};
+
+if (!process.env.TWOSPACE_NO_LISTEN) {
+  server.listen(PORT, HOST, () => {
+    console.log(`[twospace] 同步服务器 v2（账号模型）已启动：http://${HOST}:${PORT}`);
+    console.log('[twospace] 每个人注册自己的账号，两台账号互相确认后组成双人空间');
+  });
+}

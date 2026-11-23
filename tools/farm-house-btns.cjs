@@ -1,0 +1,14 @@
+const fs = require('node:fs');
+const p = 'C:/ts/src/core/farmRoomShop.ts';
+let t = fs.readFileSync(p, 'utf8');
+const from = `  woodBtn(10,by3,118,32,false,'🛋 布置小窝');
+  woodBtn(134,by3,104,32,false,'🛒 买装饰');
+  woodBtn(244,by3,VW-254,32,false,houseItems.length?('已摆 '+houseItems.length+' 件'):'还没有装饰');`;
+const to = `  var bw3=(VW-16-16)/3;
+  woodBtn(10,by3,bw3,32,false,'🛋 布置小窝');
+  woodBtn(10+bw3+8,by3,bw3,32,false,'🛒 买装饰');
+  woodBtn(10+(bw3+8)*2,by3,bw3,32,false,'📺 换源');`;
+if (!t.includes(from)) throw new Error('没找到按钮');
+t = t.replace(from, to);
+fs.writeFileSync(p, t, 'utf8');
+console.log('小屋底部改成三个按钮（布置/买装饰/换源）');
