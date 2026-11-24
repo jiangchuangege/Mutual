@@ -1,6 +1,8 @@
 # Mutual 双人空间 · 软件介绍与完整架构原理（详细版 · 当前逻辑 v3.14.19）
 
-> 配套图：同目录 `Mutual架构图.png`（高清成图）· `Mutual架构图-扁平.svg`（可编辑矢量）
+> 配套图：[`docs/Mutual架构图.png`](docs/Mutual架构图.png)（高清成图）· [`docs/Mutual架构图.svg`](docs/Mutual架构图.svg)（可编辑矢量，由 `tools/gen-arch-svg.mjs` 生成）
+>
+> 安装包：[Releases](https://github.com/jiangchuangege/Mutual/releases) · 本文件同时是仓库 README（同一份内容）
 >
 > 目录
 > - 第一部分 **软件介绍**：这是什么 / 给谁用 / 怎么开始 / 功能全景 / 体验承诺
@@ -16,6 +18,7 @@
 > - 第十一部分 **性能与体验设计**
 > - 第十二部分 **质量保障、部署与运维**
 > - 附录 **术语表 / 颜色速查 / 常见问题对照**
+> - **第十三部分** 全部模块逐一原理 · **第十四部分 当前逻辑速查（v3.14.19）**
 
 ---
 
@@ -136,7 +139,7 @@ flowchart TB
 
 ### 整体架构
 
-![img](file:///C:/Users/Jiao/Desktop/Mutual架构图.png)
+![Mutual 整体架构](docs/Mutual架构图.png)
 
 > 这张图由脚本生成，随时可重出：
 > `node tools/gen-arch-svg.mjs` → `docs/Mutual架构图.svg` → headless Edge/Chrome 截图得 PNG（1760×1360）。

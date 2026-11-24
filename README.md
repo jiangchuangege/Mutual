@@ -1,6 +1,8 @@
-# Mutual 双人空间 · 软件介绍与完整架构原理（详细版）
+# Mutual 双人空间 · 软件介绍与完整架构原理（详细版 · 当前逻辑 v3.14.19）
 
-> 配套图：同目录 `Mutual架构图.png`（高清成图）· `Mutual架构图-扁平.svg`（可编辑矢量）
+> 配套图：[`docs/Mutual架构图.png`](docs/Mutual架构图.png)（高清成图）· [`docs/Mutual架构图.svg`](docs/Mutual架构图.svg)（可编辑矢量，由 `tools/gen-arch-svg.mjs` 生成）
+>
+> 安装包：[Releases](https://github.com/jiangchuangege/Mutual/releases) · 本文件同时是仓库 README（同一份内容）
 >
 > 目录
 > - 第一部分 **软件介绍**：这是什么 / 给谁用 / 怎么开始 / 功能全景 / 体验承诺
@@ -16,6 +18,7 @@
 > - 第十一部分 **性能与体验设计**
 > - 第十二部分 **质量保障、部署与运维**
 > - 附录 **术语表 / 颜色速查 / 常见问题对照**
+> - **第十三部分** 全部模块逐一原理 · **第十四部分 当前逻辑速查（v3.14.19）**
 
 ---
 
@@ -89,7 +92,8 @@ flowchart TB
 
   subgraph L3["③ 本机存储层（缓存优先 · 永久）"]
     C1["文件缓存 cmscache/*.json"]
-    C2["APK 内置种子缓存 45MB"]
+    C2["APK 内置种子缓存（出包时生成，实测 65.97MB）"]
+    C4["prefs 双写（AsyncStorage + 文件）"]
     C3["AsyncStorage 小配置"]
   end
 
@@ -106,7 +110,7 @@ flowchart TB
   end
 
   subgraph L6["⑥ 外部依赖"]
-    E1["CMS 采集站 ×17"]
+    E1["CMS 采集站 ×19（实测 16 可用）"]
     E2["IPTV 直播源"]
     E3["Agora RTC（语音，可选）"]
   end
@@ -127,11 +131,19 @@ flowchart TB
   classDef f fill:#00695C,color:#fff,stroke:#80CBC4
   class U a
   class M,S,V b
-  class C1,C2,C3 c
+  class C1,C2,C3,C4 c
   class Y1,Y2,Y3 d
   class G1,G2,G3 e
   class E1,E2,E3 f
 ```
+
+### 整体架构
+
+![Mutual 整体架构](docs/Mutual架构图.png)
+
+> 这张图由脚本生成，随时可重出：
+> `node tools/gen-arch-svg.mjs` → `docs/Mutual架构图.svg` → headless Edge/Chrome 截图得 PNG（1760×1360）。
+> 桌面上的 `Mutual架构图.png` / `Mutual架构图.svg` 就是当前逻辑（v3.14.19）这一版。
 
 ## 7. 一次完整数据流（用户点了一下"播放"）
 
@@ -217,16 +229,33 @@ flowchart TB
 
 ```
 ① 本机文件缓存（运行期写入，永久有效）
-② APK 内置种子缓存（45MB，装完首启就有内容）
+② APK 内置种子缓存（出包时生成，实测 65.97MB；仓库里是 38 字节空壳）
 ③ 网络（实时抓取）
 ④ 都没有 → 空状态（明确提示，不假装加载）
 ```
+
+补充：**小配置**（账号会话、已读位置、搜索历史等）走 `prefs` 双写（见 §14）；
+FM 的条目列表也落文件缓存（键 `fm:items`），所以"每次进 FM 都重新拉 4MB RSS"这件事已经不存在了。
+
 
 ## 14. 为什么用文件而不是 AsyncStorage
 
 安卓 AsyncStorage 默认数据库上限 **6MB**，装不下整库内容。
 所以内容缓存全部落成 `documentDirectory/cmscache/` 下的独立 JSON 文件（容量只受手机空间限制）；
 AsyncStorage 只保留小配置：账号会话、源列表、已删源名单、通知偏好、已读位置。
+
+**但 AsyncStorage 本身也会"坏"**（真实踩过）：库写满后 `setItem` 直接抛
+`database or disk is full (code 13 SQLITE_FULL)`，而历史代码几乎都是
+`void save(...).catch(()=>{})`，于是所有设置静默失效 —— 典型症状就是
+「点了『知道了』收起动态提示框，下次打开又弹出来」。
+
+修法（`ui/prefsFile.ts`）：
+
+1. **双写**：AsyncStorage 一份 + `documentDirectory/prefs/*.json` 一份；
+2. **读新不读旧**：两边都带写入时间，谁新用谁（老格式当 0 处理，新的一份必胜）；
+3. **开机自愈**：`repairStorageOnce()` 先探一次写，写不进去就清掉**可重建的大缓存**
+   （只有 `jfm_items_v1` / `space-state`，**绝不碰用户自己加的收听源**）再重试。
+   动态已读位置、搜索历史都走这套。
 
 ## 15. 缓存键与写入粒度（全表）
 
@@ -242,6 +271,8 @@ AsyncStorage 只保留小配置：账号会话、源列表、已删源名单、�
 | 分类映射 | `mutual_catmap_v1:<源>` | 一个小文件 | 首次拉分类表 |
 | 直播台单 | `live:catalog` | 一个文件 | 直播页加载/删源 |
 | 测速结果 | `health:live` | 一个小文件 | 手动检测 |
+| 焦焦FM 条目 | `fm:items` | 一个文件（≤1200 条 + 源签名） | 每次拉完源 |
+| 小配置（双写） | `prefs/<安全键名>__<hash>.json` | 一条一个文件 | 写设置时 |
 
 **核心原则：绝不让"一个越来越大的 key"被反复整份覆盖。**
 新增内容只写它自己的分片文件，所以写入放大与"库里已有多少存量"无关。
@@ -374,7 +405,7 @@ sync-server.mjs   Node 18+，零第三方依赖，监听 8787
 每个写操作留一行日志：
 
 ```
-[rpc] 账号=TWABC123 空间=pair_TWABC123 方法=setLiveSourceUrls ok rev=6460632
+[rpc] 账号=TWJCQH72 空间=pair_TWJCQH72 方法=setLiveSourceUrls ok rev=6460632
 ```
 
 排查顺序固定：**服务端有没有收到 → 有没有生效（ok/rev）→ 再看客户端投影**。
@@ -408,13 +439,29 @@ sync-server.mjs   Node 18+，零第三方依赖，监听 8787
 
 | 指标 | 数值 |
 |---|---|
-| 可用采集站 | **17 个**（另有 3 个失效：`xgzyapi` 404、`apiyhzy` / `jszyapi` 超时） |
+| 可用采集站 | **19 个里 16 个可用**（当前失效：`api.wsyzy.net` / `cjhwba.com` / `aosikazy.com` 抓不到） |
 | 抓取行数 | 1,377,556 行 |
 | **按片名去重后** | **280,170 部** |
 | 动漫 / 日韩动漫 / 国产动漫 / 欧美动漫 | 29,018 / 9,897 / 8,936 / 1,724 |
 | 电影 / 剧集 | 98,304 / 110,527 |
 
 （重复率约 80%——各站互相搬运同一批资源，所以"行数相加"会虚高数倍。）
+
+### 搜索链路（**不扫全库**）
+
+```
+关键词 → 记录搜索历史(cms_search_history_v1)
+      → 并行问**前 8 个源**的 ?wd=<关键词>（单源 6 秒硬超时）
+      → 拿回来**再按片名过滤**（源站搜索经常乱塞）
+      → 排序：完全匹配(3) > 开头匹配(2) > 包含(1)，同名同 id 去重
+      → 最多 40 条
+兜底：源站没命中时，**只在内存里已加载的列表**里按片名过滤 —— 不翻页、不扫全库
+```
+
+- 以前"接口没命中就去拉该源第 1、2 页"（17 源 × 2 页 = 34 个请求）就是"搜索像在扫全库"的元凶，已删除；
+- 搜不到立即提示换关键词，不把整页拖住；
+- 边界：结果来自**源站自己的搜索索引**，源站没索引的片子搜不到 —— 那种情况走分类页翻（分类页按页缓存）；
+- 另外三处搜索都是**纯本地过滤**：一起听（只筛当前歌单）、焦焦FM（只筛已抓到的条目）、电视直播（只筛台单）。
 
 ### 分类严格性规则（片库不乱档）
 
@@ -476,16 +523,39 @@ CREATED → PREPARING（双方就绪）→ COUNTDOWN（倒计时）→ PLAYING �
 
 - 全局只有**一个**播放引擎实例（`useMusicEngine` 挂在 AppFrame），所有页面共享；
 - 服务端保存队列 + 当前曲目 + 进度 + 播放状态（`music.action/index/positionSec/seq`）；
-- 谁操作谁写入，另一方跟随；**"↻ 同步到这里"** = 以我当前这一秒为准，对方立刻跳过来；
+- 谁操作谁写入，另一方跟随。**"↻ 同步到这里"** 现在发的是
+  `(play|pause, positionSec)` **两件事**（只发 seek 的话，对方若是暂停状态就只纠进度不回到播放，
+  看着像"点了同步没反应"）；
+- **跟随纠正的三条护栏**（解决"点同步后一直缓冲中"）：
+  1. 刚 seek 完 **4 秒冷却**，期间不纠正；
+  2. **缓冲中一律不纠正**（每纠一次就重新缓冲，永远出不来）；
+  3. 偏差容差 1.5s → **2.5s**；主控心跳改成**真的漂了才发 seek**
+     （以前每 5 秒无脑发一次，把 seq 顶起来，两台互相对抽）；
+- **房间状态判定**（`ROOM_ON`）：
+  - `presence.ts` 里 `/listen` 上报的 surface 是 **`music`**（枚举里没有 `listen`），
+    所以判断必须认 `music` —— 以前拿 'listen' 比对，永远 false，两边一直显示「TA 还没进来」；
+  - 兜底信号：**对方最近 3 分钟内动过这个队列**（seq 变化）也算在房间里；
+  - 进页面立刻补一次 `setPresence('music')`，不等 30 秒心跳；
+  - 文案带对方真实位置：「房间已连接 · TA 也在听」/「你在房间里 · TA 在焦焦FM」；
+- **歌单收纳**（只在这份队列里，不联网）：搜索框 + 歌手 chip（从队列里现算，含数量），
+  筛选后仍显示**原始序号**，不错位；删除键是独立按钮（不嵌在整行 Pressable 里，
+  否则安卓上点 ✕ 会顺带切歌）；
 - 音频焦点统一登记：FM/试听/音乐争用时按"谁主动播谁赢"，被抢的一方自动让路（不会两段音频叠着响）；
 - 队列被删空 → 引擎立即停止并释放（不会"声音继续放但界面没有停止键"）。
 
 ## 36. 焦焦FM
 
-- 多源聚合（每个源一个 xml/json index），断源可切换；
-- 播放列表页与播放页之间**交接进度**（进播放页先 seek 再播，不会两路同时响）；
-- 换集/离开页面会 `remove()` 掉旧的原生播放器（避免多路 AudioTrack 累积）；
-- 支持"跟随对方进度"（可选开关）与休眠定时。
+- **多源聚合**（每个源一个 RSS/JSON），源是两个人共享的（`fmSources`）；
+  「收听源」已经搬到**独立页面** `/jiaojiao-fm-sources`：添加/删除/逐个检测（9 秒硬超时）/显示每个源的"条数 + 耗时 + 失败原因"；首页只剩**一行状态条**（收听源 · N 个 · 正常/慢/坏 + 刷新 + ›）；
+- **一个时刻只允许一个播放器**：换集/跟随/交接/卸载统一走 `killPlayer()`（先 `pause()` → 音量归零 → `remove()`，并用 `playersRef` 兜底扫一遍）。以前只 `remove()` 不 pause，remove 慢一拍就变成"点第 1 集再点第 2 集，两集一起放"；
+- **自动跟随只跟对方**（`remote.role === role` 直接 return）：以前连自己上次的进度也跟随，一进页面就自动开播，而 `isPlaying` 取的是 remote.playing（我是暂停）→ 声音在放、按钮却显示"播放"；
+- **集列表顺序 = 源里的顺序**（`EP_SOURCE_ORDER`，解析层不排序、界面层也不重排）：用户要求"拉取到的列表和源接口里的列表一模一样"；显示时只去掉标题里自带的集号前缀（`015_…`），因为左边已经有序号列；
+- **解析有上限**：单源最多 400 条（`MAX_FM_ITEMS_PER_SOURCE`），扫够就停（`itemBlocksUpTo`）。以前把 4MB RSS 整篇跑正则，模拟器上要 **36.8 秒**、期间 JS 线程被占住，页面一直转圈；现在 **0.3~1.2 秒**；
+- **每源 9 秒硬超时**（`Promise.race`）：AbortController 管不住 `res.text()` 卡住的情况，以前一个卡住的源能让整页永远"正在把声音拉进来"；
+- **条目落文件缓存** `fm:items`：进页面秒开，再后台刷新；源列表一变（自己加/对方加/服务端同步）自动重拉，拉完发现源又变多会自动补一轮 —— 不用手动点刷新；
+- **播放页进度条可拖动**（PanResponder）：拖动中只更新显示，**松手才 seekTo**；
+- **一起听**：列表页和播放页都有同步卡 ——「↻ 同步到这里」把自己的进度推给对方，「跟随 TA」跟到对方那一集那一秒，「开/关跟随」一键切换；播放页退出时把进度写回 `jfm_resume_v1`，回列表页接着放不会跳回旧位置；
+- 支持休眠定时、倍速、上下 15 秒。
 
 ## 37. 游戏库
 
@@ -582,13 +652,29 @@ CREATED → PREPARING（双方就绪）→ COUNTDOWN（倒计时）→ PLAYING �
 - **TypeScript 严格模式**：App 与 core 两套 `tsconfig` 均零错误；
 - **服务端语法/启动自检**：`node --check` + 启动日志（恢复账号/空间数量）。
 
-## 42. 构建
+## 42. 构建（含种子缓存的正确出包流程）
 
+**仓库里的 `assets/seed/cache-v1.json` 是 38 字节空壳**（出于版权/合规，不带任何采集站数据），
+但**发给用户的安装包要带** —— 这样装完第一次打开片库就有内容。
+
+```bash
+# 1) 生成本地填充版种子（只写工作目录，不进仓库）
+node tools/gen-seed-cache.mjs --apis-file tmp/apis.json \
+     --pages 12 --apis-cats 40 --subs 32
+#    → wrote assets/seed/cache-v1.json 65.97 MB | apis ok: 17 | keys: 398
+
+# 2) 确认 git 没被污染（该文件已 skip-worktree）
+git status --short                                # 干净
+git cat-file -s HEAD:assets/seed/cache-v1.json     # 38
+
+# 3) 出包
+cd android && ./gradlew :app:assembleRelease -PuniversalApk
+#    → Mutual-vX-universal.apk（272.41 MB：bundle 61.14 MB，其中种子 65.97 MB）
 ```
-cd android
-gradlew :app:assembleRelease -PuniversalApk
-→ Mutual-vX-universal.apk（约 260MB，含 45MB 种子缓存与全部资源）
-```
+
+- 每个请求 8 秒硬超时、分类页 4 并发，坏源直接跳过（实测 20 个接口 4~5 分钟跑完）；
+- 想瘦身：去掉 `lib/x86` + `lib/x86_64`（−23.7MB，代价是雷电模拟器装不上）、或按 ABI 分包、或压壁纸视频；
+- 空壳包 ≈ 220MB，带种子的正式包 ≈ 272MB。
 
 ## 43. 服务端部署
 
@@ -782,6 +868,7 @@ A 填 B 的账号 ID → 服务端校验（存在 / 不是自己 / 对方没有�
 
 ### 51.2 期望被照顾清单（comfort）
 - 本人写、本人删；伴侣**只能看和照做**，不能替你改；
+- **永远对伴侣可见**（`COMFORT_ALWAYS_SHARED`）：这份清单的语义就是"我同意让 TA 看见"，和经期授权是两件事。以前它被塞在 `partnerPeriod === null ? 空状态 : …` 里，对方**没有经期模块**（比如男方）时整段不渲染 —— 用户反馈"我写了，TA 看不到"；
 - 不预置模板（第一条必须自己写）；
 - `sendCareAction` 照着清单做一次 → 对方收到一条中性通知。
 
@@ -875,7 +962,9 @@ openVaultItem(id)                ← 本人或被授权人打开 → 服务端�
 ```
 - 文案原则：**只描述动作，不带内容细节**（"TA 新增了日记"，不说写了什么）；
 - 免打扰时段不弹系统通知，但 App 内提示卡照常；
-- 同一批动态在本次打开 App 期间只提示一次。
+- 同一批动态在本次打开 App 期间只提示一次；
+- **"已读位置"必须落盘且可靠**（`ACTIVITY_SEEN_KEY` 走 prefs 双写）：以前 AsyncStorage 写满 → 位置存不上 → 每次开 App 都把同一条动态当新的再弹（"点了几次「知道了」还在弹"）；
+- 提示框（ActivityDock）交互：两个按钮**平铺在卡片下半行**（以前「知道了」在右下角被音乐悬浮气泡压住一半，点偏就跳到动态页）；点卡片「看看」/点「知道了」/**进入动态页**都会真正收起，返回首页不会再弹；外层是普通 View，两个按钮各自独立。
 
 ## 59. 背景 / 壁纸 / 上传
 
@@ -901,3 +990,61 @@ openVaultItem(id)                ← 本人或被授权人打开 → 服务端�
 | 影院直播 | `addWatchQueue / playFromQueue / setRoomSource`、`setCmsApis / transferCmsManager`、`setLiveSourceUrls / transferLiveManager` |
 | 游戏 | `addGame / startGame / startSampleGame / pushGameState / pushGameNet / endGame`、`applyVoxelMod / mergeVoxelEdits` |
 | 其他 | `collectionAdd / collectionVote / collectionClaim`、`addWatchPlan / confirmWatchPlan`、`startPickSession / pickMovie / pickMatches`、`setLdr`、`updateWedding / shareWedding`、`decorate / petCare / setTheme` |
+
+---
+
+# 第十四部分 · 当前逻辑速查（v3.14.19）
+
+> 这一节是"改完之后到底是什么逻辑"的一页速查；和上面章节冲突时**以本节为准**。
+
+## 61. 搜索（4 处，规则各不相同）
+
+| 位置 | 联网 | 范围 | 上限 |
+|---|---|---|---|
+| 在线片库 | ✅ 只问**前 8 个源**的 `?wd=`（各 6 秒） | 源站搜索索引 + 内存已加载列表兜底 | 40 条 |
+| 一起听 | ❌ | **当前歌单**（+ 歌手 chip） | 全量 |
+| 焦焦FM | ❌ | 已抓到的条目（合集/单集标题） | 全量 |
+| 电视直播 | ❌ | 当前台单（含"紧匹配"：CCTV1 = CCTV-1） | 全量 |
+
+## 62. 缓存（4 级 + 双写）
+
+```
+文件缓存 cmscache/*.json  →  APK 种子缓存  →  网络  →  空状态
+小配置：AsyncStorage + prefs/*.json 双写（读新不读旧；写失败→清可重建缓存→重试）
+FM 条目：fm:items（文件缓存，带源签名）
+```
+
+## 63. 一起听
+
+- 房间状态 = 对方 presence `music` 且心跳 <150s **或** 对方 3 分钟内动过队列；
+- 进页面立刻补一次 presence；
+- 同步 = `(play|pause) + positionSec` 一起发；
+- 跟随纠正：4 秒冷却 + 缓冲中不纠 + 容差 2.5s；主控心跳"漂了才发"；
+- 歌单搜索 / 歌手筛选只在本歌单，序号不错位，删除键独立。
+
+## 64. 焦焦FM
+
+- 一个时刻只有一个播放器（pause → 音量 0 → remove + playersRef 兜底）；
+- 集列表**照抄源顺序**（只去掉标题里的集号前缀）；
+- 单源最多 400 条、9 秒硬超时、扫够就停；条目落 `fm:items` 文件缓存；
+- 「收听源」独立页 `/jiaojiao-fm-sources`，首页只留一行状态条；
+- 源一变自动重拉；拉完源又变多自动补一轮；
+- 播放页进度条可拖动（松手才 seek）；
+- 一起听：同步到这里 / 跟随 TA / 开-关跟随；退出播放页把进度交回列表页。
+
+## 65. 关怀
+
+- 经期档位（private / care / summary / full）只影响**经期相关**内容；
+- 「我希望被这样照顾」**永远对伴侣可见**（只读 + 我来）；
+- 计划记录共享与经期档位**完全解耦**（本人一键共享/撤回）。
+
+## 66. 首页首帧
+
+- 没拿到服务端快照前显示「正在连接你们的空间…」，**不会**谎报"还没有建立双人空间"；
+- 判断依据 `store.serverSnapshotReady`。
+
+## 67. 构建与文档
+
+- 仓库：种子缓存 38 字节空壳（skip-worktree），数据不入库；
+- 出包：`node tools/gen-seed-cache.mjs --apis-file tmp/apis.json` → gradle → **272.41 MB**；
+- 架构图：`node tools/gen-arch-svg.mjs` → SVG → headless 浏览器截图 → PNG（1760×1360）。
