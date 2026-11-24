@@ -1,8 +1,9 @@
+﻿import { LinearGradient } from 'expo-linear-gradient';
 import { useRouter } from 'expo-router';
 import * as DocumentPicker from 'expo-document-picker';
 import React, { useEffect, useRef, useState } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { Pressable, Image, Keyboard, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { useApp } from '../store';
@@ -57,10 +58,51 @@ export default function ListenScreen() {
     }
   }, [engine.playing]);
 
+  /** TA 现在是不是也在这个房间里（presence 里 surface=listen） */
+  const ROOM_ON =
+    (snapshot as unknown as {
+      presence?: Partial<Record<'A' | 'B', { surface: string; at: number }>>;
+    }).presence?.[partner]?.surface === 'listen';
+
   const [addOpen, setAddOpen] = useState(false);
   const [title, setTitle] = useState('');
   const [artist, setArtist] = useState('');
   const [url, setUrl] = useState('');
+
+  /*
+   * 歌单收纳（C4）：搜索 + 歌手筛选。
+   *
+   * 搜索范围**只在这份队列里**（用户明确要求"不要全库搜"）：
+   * 一起听的队列是两个人共同维护的那几十首，找歌只要在这几十首里筛，
+   * 不该跑去连服务器、更不该把整个在线片库拖进来。
+   */
+  const [musicQuery, setMusicQuery] = useState('');
+  const [artistFilter, setArtistFilter] = useState<string | null>(null);
+
+  /** 队列里出现过的歌手（按出现次数排），给筛选 chip 用 */
+  const queueArtists = React.useMemo(() => {
+    const map = new Map<string, number>();
+    for (const t of music.queue) {
+      const name = (t.artist || '未知歌手').trim() || '未知歌手';
+      map.set(name, (map.get(name) ?? 0) + 1);
+    }
+    return [...map.entries()].sort((a, b) => b[1] - a[1]);
+  }, [music.queue]);
+
+  /** 过完歌手 + 关键词之后要显示的队列（保留原下标，播放序号不能错位） */
+  const shownQueue = React.useMemo(() => {
+    const q = musicQuery.trim().toLowerCase();
+    return music.queue
+      .map((track, idx) => ({ track, idx }))
+      .filter(({ track }) => {
+        const name = (track.artist || '未知歌手').trim() || '未知歌手';
+        if (artistFilter && name !== artistFilter) return false;
+        if (!q) return true;
+        return track.title.toLowerCase().includes(q) || name.toLowerCase().includes(q);
+      });
+  }, [music.queue, musicQuery, artistFilter]);
+
+  const filtering = musicQuery.trim().length > 0 || artistFilter !== null;
 
   return (
     <View style={[styles.root, { backgroundColor: pageBg(color.bg) }]}>
@@ -73,25 +115,18 @@ export default function ListenScreen() {
 
         <View style={{ height: 12 }} />
 
-        <NoticeBar
-          tone={tint(color.skySoft)}
-          ink={color.inkMid}
-          icon="🎧"
-          text="需要一首 http(s) 直链音频（.mp3 / .m4a / .aac / .wav / .ogg）。本地文件只能自己听，跨设备同步必须用直链。"
-        />
+        {/* 房间状态 + 两个动作：对齐 / 加歌 */}
+        <View style={styles.roomRow}>
+          <View style={styles.roomChip}>
+            <View style={[styles.roomDot, ROOM_ON ? styles.roomDotOn : null]} />
+            <Text style={styles.roomText} numberOfLines={1}>
+              {ROOM_ON ? '房间已连接 · TA 也在听' : 'TA 还没进来 · 进来会自动跟随'}
+            </Text>
+          </View>
+        </View>
 
-        <View style={{ flexDirection: 'row', gap: 10 }}>
-            <Text style={[font.tiny, { marginBottom: 6, color: color.inkSoft }]}>
-                {(() => {
-                  const pp = (snapshot as unknown as {
-                    presence?: Partial<Record<'A' | 'B', { surface: string; at: number }>>;
-                  }).presence?.[(role === 'A' ? 'B' : 'A')];
-                  return pp?.surface === 'listen'
-                    ? '房间已连接：TA 也在听 · 点下面按钮可把两边对齐'
-                    : 'TA 暂时不在这个房间，TA 进来后会自动跟随';
-                })()}
-              </Text>
-<Btn
+        <View style={styles.actionRow}>
+          <Btn
             title="↻ 同步到这里"
             small
             variant="soft"
@@ -109,14 +144,73 @@ export default function ListenScreen() {
           <Btn title="＋ 加一首歌" style={{ flex: 1 }} onPress={() => setAddOpen(true)} />
         </View>
 
-        <SectionTitle
-          title={`一起听的队列 · ${music.queue.length} 首`}
-          right={
-            <Text style={[font.tiny, { color: color.inkSoft }]}>
-              {music.updatedBy === role ? '你在控制' : 'TA 在控制'}
-            </Text>
-          }
-        />
+        <View style={styles.listHeader}>
+          <Text style={styles.listTitle}>我们的歌单</Text>
+          <Text style={styles.listMeta}>
+            {filtering
+              ? `· 筛出 ${shownQueue.length} / ${music.queue.length} 首`
+              : `· ${music.queue.length} 首`}
+          </Text>
+        </View>
+
+        {/* 搜索 + 歌手筛选：只在这份队列里找 */}
+        {music.queue.length > 0 ? (
+          <Card style={{ marginBottom: 10 }}>
+            <View style={styles.searchRow}>
+              <TextInput
+                value={musicQuery}
+                onChangeText={setMusicQuery}
+                placeholder="在这份歌单里搜歌名 / 歌手"
+                placeholderTextColor={color.inkFaint}
+                style={styles.searchInput}
+                returnKeyType="search"
+                onSubmitEditing={() => Keyboard.dismiss()}
+              />
+              {filtering ? (
+                <Pressable
+                  hitSlop={8}
+                  onPress={() => {
+                    setMusicQuery('');
+                    setArtistFilter(null);
+                  }}
+                  style={styles.clearBtn}
+                >
+                  <Text style={styles.clearText}>清空</Text>
+                </Pressable>
+              ) : null}
+            </View>
+            {queueArtists.length > 1 ? (
+              <ScrollView
+                horizontal
+                showsHorizontalScrollIndicator={false}
+                contentContainerStyle={styles.chipRow}
+              >
+                <Pressable
+                  onPress={() => setArtistFilter(null)}
+                  style={[styles.chip, artistFilter === null ? styles.chipOn : null]}
+                >
+                  <Text style={[styles.chipText, artistFilter === null ? styles.chipTextOn : null]}>
+                    全部 {music.queue.length}
+                  </Text>
+                </Pressable>
+                {queueArtists.map(([name, count]) => {
+                  const on = artistFilter === name;
+                  return (
+                    <Pressable
+                      key={name}
+                      onPress={() => setArtistFilter(on ? null : name)}
+                      style={[styles.chip, on ? styles.chipOn : null]}
+                    >
+                      <Text style={[styles.chipText, on ? styles.chipTextOn : null]} numberOfLines={1}>
+                        {name} {count}
+                      </Text>
+                    </Pressable>
+                  );
+                })}
+              </ScrollView>
+            ) : null}
+          </Card>
+        ) : null}
 
         {music.queue.length === 0 ? (
           <Card>
@@ -124,50 +218,81 @@ export default function ListenScreen() {
               队列还是空的。加一首你喜欢的直链音频，两个人就能同时听到同一段进度。
             </Text>
           </Card>
+        ) : shownQueue.length === 0 ? (
+          <Card>
+            <Text style={font.small}>这份歌单里没有匹配的歌，换个词试试。</Text>
+          </Card>
         ) : (
-          music.queue.map((track, idx) => {
+          shownQueue.map(({ track, idx }) => {
             const active = idx === music.index;
-            // 正在放的那一首：显示真实的播放状态（和上面的大按钮同一个 engine）
-            const label = active ? (engine.playing ? '⏸' : '▶') : String(idx + 1);
+            const name = (track.artist || '未知歌手').trim() || '未知歌手';
             return (
-              <Card key={track.id} tone={active ? color.primarySoft : surf('base')}>
-                <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-                  <Pressable
-                    onPress={() => engine.selectTrack(idx)}
-                    style={[styles.playDot, active ? styles.playDotActive : null]}
-                  >
-                    <Text style={{ color: active ? '#FFFFFF' : color.inkSoft, fontSize: 11 }}>
-                      {label}
-                    </Text>
-                  </Pressable>
-                  <Pressable style={{ flex: 1, marginLeft: 10 }} onPress={() => engine.selectTrack(idx)}>
-                    <Text style={font.bodyStrong} numberOfLines={1}>
-                      {track.title}
-                    </Text>
-                    <Text style={[font.tiny, { marginTop: 2 }]} numberOfLines={1}>
-                      {track.artist || '未知歌手'} · 由 {track.addedBy === role ? '我' : snapshot.members[track.addedBy].name} 添加
-                    </Text>
-                  </Pressable>
-                  <Pressable hitSlop={10} onPress={() => store.removeMusicTrack(track.id)}>
-                    <Text style={[font.tiny, { color: color.danger }]}>删除</Text>
-                  </Pressable>
+              <Pressable
+                key={track.id}
+                onPress={() => engine.selectTrack(idx)}
+                style={[styles.trackCard, active ? styles.trackCardOn : null]}
+              >
+                {active ? (
+                  <LinearGradient
+                    colors={['rgba(255,214,203,0.85)', 'rgba(255,244,240,0.4)', 'rgba(201,166,232,0.22)']}
+                    start={{ x: 0, y: 0 }}
+                    end={{ x: 1, y: 1 }}
+                    style={StyleSheet.absoluteFill}
+                    pointerEvents="none"
+                  />
+                ) : null}
+                <View style={styles.coverWrap}>
+                  {track.cover ? (
+                    <Image source={{ uri: track.cover }} style={styles.cover} />
+                  ) : (
+                    <View style={[styles.cover, styles.coverFallback]}>
+                      <Text style={{ fontSize: 15, color: color.primaryInk }}>♪</Text>
+                    </View>
+                  )}
+                  {active ? (
+                    <View style={styles.coverBadge}>
+                      <Text style={styles.coverBadgeText}>{engine.playing ? '❚❚' : '▶'}</Text>
+                    </View>
+                  ) : null}
                 </View>
-              </Card>
+                <View style={{ flex: 1, marginLeft: 10 }}>
+                  <Text
+                    style={[font.bodyStrong, active ? { color: color.primaryInk } : null]}
+                    numberOfLines={1}
+                  >
+                    {track.title}
+                  </Text>
+                  <Text style={[font.tiny, { marginTop: 3, color: color.inkMid }]} numberOfLines={1}>
+                    {name} · {track.addedBy === role ? '我' : snapshot.members[track.addedBy].name} 添加
+                  </Text>
+                </View>
+                {active ? (
+                  <View style={styles.nowBadge}>
+                    <Text style={styles.nowText}>正在放</Text>
+                  </View>
+                ) : (
+                  <Text style={styles.idxText}>{idx + 1}</Text>
+                )}
+                <Pressable
+                  hitSlop={12}
+                  onPress={() => store.removeMusicTrack(track.id)}
+                  style={styles.delBtn}
+                >
+                  <Text style={{ color: color.danger, fontSize: 12 }}>✕</Text>
+                </Pressable>
+              </Pressable>
             );
           })
         )}
 
-        <SectionTitle title="音频焦点怎么处理" />
-        <Card>
-          <Text style={[font.small, { lineHeight: 20 }]}>
-            音乐和语音同时开时，系统默认走「通话模式」：音量键调的是通话音量，不是音乐音量。
-            所以我们做了三件事：
-            {'\n'}· 语音一接通，音乐自动降到 35%，人脸对脸说话不会被盖住；
-            {'\n'}· 挂断后自动恢复 100%；
-            {'\n'}· 语音音量在语音面板里单独调（`adjustPlaybackSignalVolume`），不动系统媒体音量。
+        {/* 技术说明收成一行小字：这一页的重点是"我们一起听"，不是系统音量学 */}
+        <View style={styles.footNote}>
+          <Text style={styles.footNoteText}>
+            语音一接通，音乐自动降到 35%，挂断恢复 100%（不会盖住你们说话）
           </Text>
-        </Card>
+        </View>
 
+        <View style={{ height: 8 }} />
         <Btn title="返回" variant="ghost" onPress={() => router.back()} />
         <View style={{ height: 40 + insets.bottom }} />
       </Screen>
@@ -235,6 +360,37 @@ export default function ListenScreen() {
 
 const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: color.bg },
+
+  // ── 一句话说明 / 房间状态 ────────────────────────────────────────────
+  tipRow: { alignItems: 'center', marginBottom: 10 },
+  tipText: { fontSize: 10.5, color: color.inkSoft, letterSpacing: 0.2 },
+  roomRow: { flexDirection: 'row', alignItems: 'center', marginBottom: 10 },
+  roomChip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: radius.pill,
+    backgroundColor: 'rgba(255,255,255,0.66)',
+    borderWidth: 1,
+    borderColor: color.line,
+  },
+  roomDot: { width: 6, height: 6, borderRadius: 3, backgroundColor: color.inkFaint, marginRight: 6 },
+  roomDotOn: { backgroundColor: '#54C08A' },
+  roomText: { fontSize: 10.5, color: color.inkMid },
+  actionRow: { flexDirection: 'row', gap: 10, marginBottom: 16 },
+
+  // ── 歌单标题 ────────────────────────────────────────────────────────
+  listHeader: {
+    flexDirection: 'row',
+    alignItems: 'baseline',
+    marginBottom: 10,
+  },
+  listTitle: { fontSize: 16, fontWeight: '800', color: color.ink, letterSpacing: 0.3 },
+  listMeta: { fontSize: 10.5, color: color.inkSoft, marginLeft: 8 },
+  footNote: { alignItems: 'center', marginTop: 6 },
+  footNoteText: { fontSize: 10, color: color.inkFaint, textAlign: 'center' },
+
   playDot: {
     width: 26,
     height: 26,
@@ -246,4 +402,96 @@ const styles = StyleSheet.create({
     borderColor: color.line,
   },
   playDotActive: { backgroundColor: color.primary, borderColor: color.primary },
+
+  // ── 歌单：搜索 / 筛选 ───────────────────────────────────────────────
+  searchRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  searchInput: {
+    flex: 1,
+    backgroundColor: surf('alt'),
+    borderRadius: radius.md,
+    paddingHorizontal: 12,
+    paddingVertical: 9,
+    color: color.ink,
+    fontSize: 13,
+  },
+  clearBtn: {
+    paddingHorizontal: 10,
+    paddingVertical: 7,
+    borderRadius: radius.md,
+    backgroundColor: color.primarySoft,
+  },
+  clearText: { fontSize: 11, fontWeight: '700', color: color.primaryInk },
+  chipRow: { gap: 8, paddingTop: 10, paddingRight: 4 },
+  chip: {
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: radius.pill,
+    backgroundColor: surf('alt'),
+    borderWidth: 1,
+    borderColor: color.line,
+    maxWidth: 160,
+  },
+  chipOn: { backgroundColor: color.primary, borderColor: color.primary },
+  chipText: { fontSize: 11, fontWeight: '700', color: color.inkMid },
+  chipTextOn: { color: '#FFFFFF' },
+
+  // ── 歌单：一行一首 ──────────────────────────────────────────────────
+  trackCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: surf('base'),
+    borderRadius: radius.lg,
+    paddingVertical: 9,
+    paddingHorizontal: 10,
+    marginBottom: 8,
+    borderWidth: 1,
+    borderColor: color.line,
+  },
+  trackCardOn: { borderColor: color.primary, backgroundColor: '#FFF7F3', overflow: 'hidden' },
+  coverWrap: { width: 46, height: 46 },
+  cover: { width: 46, height: 46, borderRadius: 12 },
+  coverFallback: {
+    width: 46,
+    height: 46,
+    borderRadius: 12,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: color.primarySoft,
+  },
+  coverBadge: {
+    position: 'absolute',
+    right: -4,
+    bottom: -4,
+    width: 20,
+    height: 20,
+    borderRadius: 10,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: color.primary,
+  },
+  coverBadgeText: { color: '#FFFFFF', fontSize: 8.5, fontWeight: '800' },
+  nowBadge: {
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: radius.pill,
+    backgroundColor: color.primary,
+    marginLeft: 6,
+  },
+  nowText: { color: '#FFFFFF', fontSize: 9.5, fontWeight: '800' },
+  idxText: {
+    fontSize: 11,
+    color: color.inkFaint,
+    marginLeft: 8,
+    minWidth: 16,
+    textAlign: 'right',
+  },
+  delBtn: {
+    marginLeft: 8,
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: surf('alt'),
+  },
 });

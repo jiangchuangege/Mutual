@@ -192,7 +192,7 @@ export default function LiveScreen() {
           <ActivityIndicator color={night.cyan} />
           <Text style={[nightFont.body, { marginTop: 10 }]}>正在读取直播源…</Text>
         </View>
-      ) : entries.length === 0 ? (
+      ) : !loading && entries.length === 0 ? (
         /* 空状态：没有源 */
         <ScrollView contentContainerStyle={{ padding: 20, paddingBottom: insets.bottom + 130 }}>
           <View style={{ alignItems: 'center', marginTop: 20 }}>
@@ -298,22 +298,52 @@ export default function LiveScreen() {
               <Text style={styles.sourceBackText}>‹ 返回直播源</Text>
             </Pressable>
           ) : (
-            <Glass tone="dark" radius={16} style={{ marginBottom: 10 }}>
-            <Pressable onPress={() => setOpenSource(true)} style={styles.sourceCardGlass}>
-              <Ico name="live" size="xl" color="#57F8FF" />
-              <View style={{ flex: 1, marginLeft: 12 }}>
-                <Text style={styles.sourceName} numberOfLines={1}>
-                  {entries[0]?.name ||
-                (store.liveSourceUrls?.[0] ?? '').replace(/^https?:\/\//, '').split('/')[0] ||
-                '我的直播源'}
-                </Text>
-                <Text style={styles.sourceMeta} numberOfLines={1}>
-                  {groups.length} 个分组 · {groups.reduce((n, g) => n + g.channels.length, 0)} 个台 · 点开观看
-                </Text>
-              </View>
-              <Text style={{ color: night.textDim }}>›</Text>
-            </Pressable>
-            </Glass>
+            /*
+             * ONE_SOURCE_ONE_CARD：每个直播源 = 一个独立合集卡片。
+             * 以前只渲染 entries[0] 一张卡，加了第二个源仍显示第一个，
+             * 看起来像"第二个源被塞进了第一个合集"。
+             */
+            <>
+              {(catalog?.sources ?? []).map((src) => {
+                const label =
+                  entries.find((e2) => e2.url === src.url)?.name ||
+                  String(src.url ?? '').replace(/^https?:\/\//, '').split('/')[0] ||
+                  src.name ||
+                  '直播源';
+                const chCount = src.channels?.length ?? 0;
+                const gCount = new Set((src.channels ?? []).map((c) => c.group)).size;
+                return (
+                  <Glass key={src.id} tone="dark" radius={16} style={{ marginBottom: 10 }}>
+                    <Pressable
+                      onPress={() => {
+                        setSourceFilter(src.id);
+                        setOpenSource(true);
+                        setOpenGroup(null);
+                      }}
+                      style={styles.sourceCardGlass}
+                    >
+                      <Ico name="live" size="xl" color={src.ok ? '#57F8FF' : night.danger} />
+                      <View style={{ flex: 1, marginLeft: 12 }}>
+                        <Text style={styles.sourceName} numberOfLines={1}>
+                          {label}
+                        </Text>
+                        <Text style={styles.sourceMeta} numberOfLines={1}>
+                          {src.ok
+                            ? `${gCount} 个分组 · ${chCount} 个台 · 点开观看`
+                            : `读不出来：${src.error ?? '源失效'}`}
+                        </Text>
+                      </View>
+                      <Text style={{ color: night.textDim }}>›</Text>
+                    </Pressable>
+                  </Glass>
+                );
+              })}
+              {(catalog?.sources ?? []).length === 0 ? (
+                <Glass tone="dark" radius={16} style={{ marginBottom: 10 }}>
+                  <Text style={nightFont.small}>还没有可用的直播源，去「直播源」里加一个。</Text>
+                </Glass>
+              ) : null}
+            </>
           )}
           {openSource && openGroup ? (
             <>

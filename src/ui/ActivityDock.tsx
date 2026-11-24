@@ -19,6 +19,17 @@ import { color } from './theme';
  *
  * 数据来自快照里的 `activity`，store 已经把"提醒过没有"记在本地了，
  * 所以重连、重开 App 都不会重复弹。
+ *
+ * ── 2026-11 修复（用户反馈："点了几次「知道了」它还在弹"）──
+ * 三处都是"点了没反应 / 点了还在"的直接原因，一起改掉：
+ *   1. 「知道了」以前是**嵌在外层 Pressable 里面的小按钮**，而且在屏幕右下角，
+ *      正好被音乐播放的悬浮气泡（zIndex 999）压住一半 → 点偏一点就落到外层卡片上，
+ *      于是跳去动态页，回来时提示框**原封不动**又出现（看起来就是"点了没关掉"）。
+ *      现在两个动作各自是独立按钮、平铺在卡片下半行，卡片右边缘也不再伸进气泡的地盘。
+ *   2. 外层卡片"点这里看看"以前只调用 markActivityRead()，**没有把提示框本身收起来**；
+ *      从动态页返回后 activityNotice 还在，于是原地复活。现在点卡片也会收起。
+ *   3. 人已经进了动态页（/activity）就说明"看到了"，这里顺手把提示框收掉，
+ *      返回首页不会再莫名其妙弹出来一次。
  */
 export function ActivityDock() {
   const { store } = useApp();
@@ -27,8 +38,14 @@ export function ActivityDock() {
   const insets = useSafeAreaInsets();
 
   const pending = store.pendingActivityNotice;
-  // 已经在动态页里看了，就不用再挂一个提示框
-  if (!pending || pathname === '/activity') return null;
+  const onActivityPage = pathname === '/activity';
+
+  // 已经在动态页里看了 = 已读：进页面这一下就把提示框收掉，返回时不再出现
+  React.useEffect(() => {
+    if (onActivityPage && store.pendingActivityNotice) store.dismissActivityNotice();
+  }, [onActivityPage, store]);
+
+  if (!pending || onActivityPage) return null;
 
   const text = activityToToast(pending);
 
@@ -37,28 +54,36 @@ export function ActivityDock() {
       pointerEvents="box-none"
       style={[styles.host, { paddingBottom: insets.bottom + 78 }]}
     >
-      <Pressable
-        style={styles.card}
-        onPress={() => {
-          store.markActivityRead();
-          router.push('/activity');
-        }}
-      >
-        <Text style={styles.emoji}>📣</Text>
-        <View style={styles.body}>
-          <Text style={styles.title} numberOfLines={2}>
-            {text}
-          </Text>
-          <Text style={styles.hint}>点这里看看 · 收起请点右边</Text>
+      <View style={styles.card}>
+        <View style={styles.rowTop}>
+          <Text style={styles.emoji}>📣</Text>
+          <View style={styles.body}>
+            <Text style={styles.title} numberOfLines={2}>
+              {text}
+            </Text>
+            <Text style={styles.hint}>TA 刚在软件里动了一下</Text>
+          </View>
         </View>
-        <Pressable
-          hitSlop={10}
-          onPress={() => store.dismissActivityNotice()}
-          style={styles.close}
-        >
-          <Text style={styles.closeText}>知道了</Text>
-        </Pressable>
-      </Pressable>
+        <View style={styles.rowBtns}>
+          <Pressable
+            hitSlop={8}
+            onPress={() => {
+              store.dismissActivityNotice();
+              router.push('/activity');
+            }}
+            style={[styles.btn, styles.btnGhost]}
+          >
+            <Text style={styles.btnGhostText}>看看</Text>
+          </Pressable>
+          <Pressable
+            hitSlop={8}
+            onPress={() => store.dismissActivityNotice()}
+            style={[styles.btn, styles.btnSolid]}
+          >
+            <Text style={styles.btnSolidText}>知道了</Text>
+          </Pressable>
+        </View>
+      </View>
     </View>
   );
 }
@@ -72,11 +97,11 @@ const styles = StyleSheet.create({
     right: 0,
     paddingHorizontal: 12,
     alignItems: 'center',
-    zIndex: 60,
+    // 必须高于音乐悬浮气泡（zIndex 999）和通话悬浮窗，否则点不到「知道了」
+    zIndex: 1200,
+    elevation: 24,
   },
   card: {
-    flexDirection: 'row',
-    alignItems: 'flex-start',
     width: '100%',
     maxWidth: 560,
     backgroundColor: '#FFFDFB',
@@ -87,17 +112,22 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
     ...shadow.float,
   },
+  rowTop: { flexDirection: 'row', alignItems: 'flex-start' },
+  rowBtns: { flexDirection: 'row', gap: 8, marginTop: 8 },
+  btn: {
+    flex: 1,
+    height: 34,
+    borderRadius: radius.md,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  btnGhost: { backgroundColor: color.primarySoft },
+  btnSolid: { backgroundColor: color.primary },
+  btnGhostText: { fontSize: 12, fontWeight: '700', color: color.primaryInk },
+  btnSolidText: { fontSize: 12, fontWeight: '700', color: '#FFFFFF' },
   emoji: { fontSize: 18, marginRight: 8, lineHeight: 22 },
   body: { flex: 1 },
   title: { fontSize: 13, fontWeight: '700', color: color.ink, lineHeight: 18 },
   hint: { fontSize: 10, color: color.inkMid, marginTop: 2 },
-  close: {
-    marginLeft: 10,
-    paddingHorizontal: 10,
-    paddingVertical: 6,
-    borderRadius: radius.md,
-    backgroundColor: color.primarySoft,
-  },
-  closeText: { fontSize: 11, fontWeight: '700', color: color.primaryInk },
   text: { ...font.tiny },
 });

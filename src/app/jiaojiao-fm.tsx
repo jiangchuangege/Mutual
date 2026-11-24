@@ -1,4 +1,4 @@
-import AsyncStorage from '@react-native-async-storage/async-storage';
+﻿import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useRouter } from 'expo-router';
 import { createAudioPlayer, setAudioModeAsync, type AudioPlayer } from 'expo-audio';
 import { claimAudioFocus, registerAudioOwner, releaseAudioFocus, unregisterAudioOwner } from '../lib/audioFocus';
@@ -6,6 +6,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Image,
+  Keyboard,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -512,7 +513,7 @@ export default function JiaojiaoFmScreen() {
           </Pressable>
         </View>
 
-        {/* 搜索 */}
+        {/* 搜索：输入即筛（只筛已抓到的条目，不联网全库搜），按钮只负责收键盘/确认 */}
         <View style={styles.searchRow}>
           <TextInput
             value={query}
@@ -520,19 +521,29 @@ export default function JiaojiaoFmScreen() {
             placeholder="搜书名、故事名、主播"
             placeholderTextColor={night.textFaint}
             style={styles.search}
+            returnKeyType="search"
+            onSubmitEditing={() => Keyboard.dismiss()}
           />
-          <Pressable onPress={() => void refresh()} style={styles.searchBtn}>
-            <Text style={styles.searchBtnText}>{loading ? '…' : '刷新'}</Text>
+          <Pressable onPress={() => Keyboard.dismiss()} style={styles.searchBtn}>
+            <Text style={styles.searchBtnText}>搜索</Text>
           </Pressable>
         </View>
 
         {/* 源状态 */}
         <Card tone={night.glass as unknown as string}>
           <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-            <Text style={[font.bodyStrong, { color: night.text, flex: 1 }]}>收听源</Text>
-            <Text style={{ color: night.cyan, fontSize: 11 }}>
+            <Text style={[font.bodyStrong, { color: night.text, flex: 1 }]} numberOfLines={1}>
+              收听源
+            </Text>
+            <Text style={{ color: night.cyan, fontSize: 11, flexShrink: 1 }} numberOfLines={1}>
               {reports.length ? healthSummary(reports) : `${allSources.length} 个`}
             </Text>
+          </View>
+          {/* 刷新从搜索按钮挪到这里：搜索旁边应该是搜索，不该是刷新 */}
+          <View style={{ alignItems: 'flex-end', marginTop: 8 }}>
+            <Pressable onPress={() => void refresh()} hitSlop={8} style={styles.srcRefreshBtn}>
+              <Text style={styles.srcRefreshText}>{loading ? '刷新中…' : '↻ 刷新'}</Text>
+            </Pressable>
           </View>
           {allSources.length === 0 ? (
             <Text style={styles.hint}>还没有收听源。支持 音频直链 / 播客 RSS / 列表 JSON。</Text>
@@ -803,6 +814,16 @@ const styles = StyleSheet.create({
     backgroundColor: night.cyan,
   },
   searchBtnText: { color: '#08111F', fontWeight: '800', fontSize: 12 },
+  srcRefreshBtn: {
+    marginLeft: 0,
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: radius.sm ?? radius.md,
+    backgroundColor: 'rgba(87,248,255,0.92)',
+    borderWidth: 1,
+    borderColor: 'rgba(87,248,255,1)',
+  },
+  srcRefreshText: { color: '#08111F', fontSize: 11, fontWeight: '800' },
   hint: { fontSize: 11.5, color: night.textDim, lineHeight: 18, marginTop: 6 },
   srcRow: { flexDirection: 'row', alignItems: 'center', gap: 8, paddingVertical: 7 },
   dot: { width: 7, height: 7, borderRadius: 4 },

@@ -1,5 +1,6 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useRouter } from 'expo-router';
+import { prefGet, prefRemove, prefSet } from '../ui/prefsFile';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { isFresh, readCmsCache, writeCmsCache } from '../ui/cmsCache';
 import { LIBRARY_STATS } from '../ui/libraryStats';
@@ -95,7 +96,7 @@ export default function CinemaLibraryScreen() {
   const [history, setHistory] = useState<string[]>([]);
   const HISTORY_KEY = 'cms_search_history_v1';
   useEffect(() => {
-    void AsyncStorage.getItem(HISTORY_KEY)
+    void prefGet(HISTORY_KEY)
       .then((raw) => {
         const list = raw ? (JSON.parse(raw) as string[]) : [];
         if (Array.isArray(list)) setHistory(list.slice(0, 10));
@@ -107,7 +108,7 @@ export default function CinemaLibraryScreen() {
     if (!k) return;
     setHistory((prev) => {
       const next = [k, ...prev.filter((x) => x !== k)].slice(0, 10);
-      void AsyncStorage.setItem(HISTORY_KEY, JSON.stringify(next)).catch(() => undefined);
+      void prefSet(HISTORY_KEY, JSON.stringify(next));
       return next;
     });
   };
@@ -851,7 +852,7 @@ export default function CinemaLibraryScreen() {
           <Pressable
             onPress={() => {
               setHistory([]);
-              void AsyncStorage.removeItem(HISTORY_KEY).catch(() => undefined);
+              void prefRemove(HISTORY_KEY);
             }}
           >
             <Text style={{ color: night.textDim, fontSize: 11 }}>清空</Text>

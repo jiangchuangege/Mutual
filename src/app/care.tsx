@@ -393,7 +393,7 @@ export default function CareScreen() {
               <EmptyState
                 emoji="🔒"
                 title={`这是${store.partnerLabel}的关怀信息`}
-                desc="对方还没授权给你看任何内容 —— 先看得到的人只有 TA 自己。想关心的话，直接问 TA 也行。"
+                desc="对方还没授权经期相关内容 —— 那部分只有 TA 自己能看。但 TA 亲手写的「希望你这样照顾」在下面，随时可以照着做。"
               />
             ) : (
               <>
@@ -463,27 +463,36 @@ export default function CareScreen() {
                   </>
                 ) : null}
 
-                <SectionTitle
-                  title={`${snapshot.members[partner].name || 'TA'} 希望你这样照顾`}
-                  right={<Text style={font.tiny}>TA 自己写的</Text>}
-                />
-                {snapshot.partnerComfort.length === 0 ? (
-                  <Card>
-                    <Text style={[font.small]}>
-                      TA 还没写。让 TA 在「关怀 → 我的」里加几条；写完之后这里会显示，你就可以照着做。
-                    </Text>
-                  </Card>
-                ) : (
-                  snapshot.partnerComfort.map((item) => (
-                    <Card key={item.id}>
-                      <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-                        <Text style={[font.bodyStrong, { flex: 1 }]}>{item.text}</Text>
-                        <Btn title="我来" small onPress={() => store.sendCareAction(item.id)} />
-                      </View>
-                    </Card>
-                  ))
-                )}
               </>
+            )}
+            {/*
+             * 「TA 希望你这样照顾」= 对方**主动写下**的照顾清单（myComfort）。
+             *
+             * COMFORT_ALWAYS_SHARED：这份清单的语义就是"我同意让 TA 看见"，
+             * 它跟经期授权完全是两件事。以前它被塞在 `partnerPeriod === null ? 空状态 : …`
+             * 里，于是对方**没有经期模块**（比如男方，或还没做任何经期授权）时，
+             * 整段都不渲染 —— 用户反馈"我写了『我希望被这样照顾』，TA 那边看不到"。
+             * 现在无论对方有没有授权经期信息，这一块都显示。
+             */}
+            <SectionTitle
+              title={`${snapshot.members[partner].name || 'TA'} 希望你这样照顾`}
+              right={<Text style={font.tiny}>TA 自己写的</Text>}
+            />
+            {snapshot.partnerComfort.length === 0 ? (
+              <Card>
+                <Text style={[font.small]}>
+                  TA 还没写。让 TA 在「关怀 → 我的」里加几条；写完之后这里会显示，你就可以照着做。
+                </Text>
+              </Card>
+            ) : (
+              snapshot.partnerComfort.map((item) => (
+                <Card key={item.id}>
+                  <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+                    <Text style={[font.bodyStrong, { flex: 1 }]}>{item.text}</Text>
+                    <Btn title="我来" small onPress={() => store.sendCareAction(item.id)} />
+                  </View>
+                </Card>
+              ))
             )}
             <Disclaimer text="伴侣端不提供任何「推断式」统计（例如记录频次），避免间接泄露。" />
           </>

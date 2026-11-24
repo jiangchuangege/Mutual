@@ -1,4 +1,4 @@
-/**
+﻿/**
  * 全局状态：Hub + 两台模拟设备 + 当前演示角色
  */
 import React, {
@@ -41,7 +41,8 @@ import type { ConnectionStatusInfo } from './core/connectionManager';
 import { loadServerSettings, saveServerUrl, setAutoConnect } from './core/serverConfig';
 import { getCmsApiList, saveCmsApiList } from './core/cmsConfig';
 import { entriesFromUrls, getLiveSources, saveLiveSources } from './core/liveConfig';
-import { activityToToast, loadActivitySeenAt, saveActivitySeenAt } from './core/activityFeed';
+import { ACTIVITY_SEEN_KEY, activityToToast } from './core/activityFeed';
+import { prefGetNumber, prefSetNumber, repairStorageOnce } from './ui/prefsFile';
 import { avatarKind, resolveAvatarUri } from './core/avatar';
 import { DEFAULT_NOTIFY_PREFS, loadNotifyPrefs, saveNotifyPrefs } from './core/notifyPrefs';
 import type { NotifyPrefs } from './core/notifyPrefs';
@@ -1187,7 +1188,7 @@ export class AppStore {
     if (fresh.length === 0) return;
     const newest = fresh[0];
     this.activitySeenAt = Math.max(this.activitySeenAt, newest.at);
-    void saveActivitySeenAt(this.activitySeenAt);
+    void prefSetNumber(ACTIVITY_SEEN_KEY, this.activitySeenAt);
     /*
      * 同一条动态只在本次进程里提示一次：
      * 以前 activitySeenAt 靠 AsyncStorage 持久化，一旦那次写入失败（或换了账号/清了存档），
@@ -1684,8 +1685,21 @@ export class AppStore {
   }
 
   /** 用户点了「知道了」：收起提示框，并把动态标记为已读 */
+  /** 把"已读位置"推到当前时间并持久化（点「知道了」、点「抱抱」都会调用） */
+  markActivitySeenNow(): void {
+    this.activitySeenAt = Date.now();
+    void prefSetNumber(ACTIVITY_SEEN_KEY, this.activitySeenAt);
+    if (this.activityNotice) this.activityNotice = null;
+    this.bump();
+  }
+
   dismissActivityNotice(): void {
     this.activityNotice = null;
+    /*
+     * 用户点了「知道了」= 永久已读：把已读位置推到"现在"并落盘，
+     * 否则下次打开 App 同一条动态又会弹出来（用户反馈"每次都弹，烦死了"）。
+     */
+    this.markActivitySeenNow();
     this.markActivityRead();
     this.bump();
   }
@@ -1702,7 +1716,7 @@ export class AppStore {
     const newest = feed[0].at;
     if (newest <= this.activitySeenAt) return;
     this.activitySeenAt = newest;
-    void saveActivitySeenAt(newest);
+    void prefSetNumber(ACTIVITY_SEEN_KEY, newest);
     this.bump();
   }
 
@@ -2121,8 +2135,10 @@ export class AppStore {
     } catch {
       this.profileBackup = null;
     }
+    // AsyncStorage 满了会让所有"设置"静默失效，开机先自愈一次
+    await repairStorageOnce();
     try {
-      this.activitySeenAt = await loadActivitySeenAt();
+      this.activitySeenAt = await prefGetNumber(ACTIVITY_SEEN_KEY);
     } catch {
       this.activitySeenAt = 0;
     }
@@ -2283,6 +2299,7 @@ export class AppStore {
     if (!result.ok) {
       this.toast(result.error, 'warn');
       return false;
+    this.markActivitySeenNow();
     }
     this.toast('已经抱到 TA 了', 'ok');
     this.bump();

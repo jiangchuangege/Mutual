@@ -553,6 +553,31 @@ export function CollectionScreen({
           <View style={{ marginBottom: 12 }}>
             <Text style={[font.tiny, { marginBottom: 6 }]}>照片（最多 3 张，从相册选择）</Text>
             <Btn title="从相册选择照片" small variant="soft" onPress={() => void pickPhotos()} />
+            {/* A2：选完立刻显示缩略图，点 × 可删 */}
+            {['photo1', 'photo2', 'photo3'].some((k) => meta[k]) ? (
+              <View style={{ flexDirection: 'row', gap: 8, marginTop: 8, flexWrap: 'wrap' }}>
+                {(['photo1', 'photo2', 'photo3'] as const)
+                  .filter((k) => meta[k])
+                  .map((k) => (
+                    <View key={k} style={{ position: 'relative' }}>
+                      <Image
+                        source={{ uri: meta[k] }}
+                        style={{ width: 82, height: 82, borderRadius: 10 }}
+                        resizeMode="cover"
+                      />
+                      <Pressable
+                        onPress={() => setMeta({ ...meta, [k]: '' })}
+                        style={{
+                          position: 'absolute', top: -6, right: -6, width: 22, height: 22, borderRadius: 11,
+                          backgroundColor: 'rgba(0,0,0,0.72)', alignItems: 'center', justifyContent: 'center',
+                        }}
+                      >
+                        <Text style={{ color: '#fff', fontSize: 13, lineHeight: 15 }}>×</Text>
+                      </Pressable>
+                    </View>
+                  ))}
+              </View>
+            ) : null}
             <Text style={[font.tiny, { marginTop: 6 }]}>
               已选 {['photo1', 'photo2', 'photo3'].filter((k) => meta[k]).length} 张
             </Text>
