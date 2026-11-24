@@ -47,9 +47,16 @@ const APIS = (() => {
 })();
 
 const HARD_TIMEOUT_MS = 8000;
-const PAGES_PER_API = 8;
-const CATS_FOR_SEED = 20;
-const SUBS_PER_API = 24;
+/** 命令行覆盖：--pages 8 --apis-cats 20 --subs 24（数字越大种子越肥） */
+function argNum(flag, def) {
+  const i = process.argv.indexOf(flag);
+  const v = i > 0 ? Number(process.argv[i + 1]) : NaN;
+  return Number.isFinite(v) && v > 0 ? v : def;
+}
+
+const PAGES_PER_API = argNum('--pages', 8);
+const CATS_FOR_SEED = argNum('--apis-cats', 20);
+const SUBS_PER_API = argNum('--subs', 24);
 const CAT_CONCURRENCY = 4;
 
 /** 任何请求都不许超过 HARD_TIMEOUT_MS，超时就当"没有" */
