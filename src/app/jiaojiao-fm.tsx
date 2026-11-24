@@ -425,7 +425,17 @@ export default function JiaojiaoFmScreen() {
 
   /** 拉取所有源：解析条目 + 记健康状态（0 条就算坏） */
   const refresh = async (list?: FmSource[]) => {
-    const use = (list ?? allSources).filter((s) => s.enabled);
+    /*
+     * SOURCE_LIVE：refresh 必须用**当下**最全的源列表。
+     * 以前用渲染闭包里的 allSources：进页面时服务端快照还没到，闭包里只有本地那 1 个源，
+     * 于是只拉了 1 个源、另一个永远"未检测"，必须手动点刷新才补上。
+     */
+    const liveShared =
+      ((store.snapshot as unknown as { fmSources?: FmSource[] }).fmSources ?? []).filter(
+        (s) => s && s.url && s.enabled !== false,
+      );
+    const base = list ?? (liveShared.length > 0 ? liveShared : allSources);
+    const use = base.filter((s) => s.enabled);
     if (!use.length) {
       setItems([]);
       setReports([]);
@@ -545,6 +555,15 @@ export default function JiaojiaoFmScreen() {
     void AsyncStorage.setItem(ITEMS_KEY, JSON.stringify(dedup.slice(0, 600))).catch(() => undefined);
     setReports(nextReports);
     setLoading(false);
+    /* 拉的过程中源列表又变多了（对方刚加了一个）：自动补一轮 */
+    const newestShared =
+      ((store.snapshot as unknown as { fmSources?: FmSource[] }).fmSources ?? []).filter(
+        (s) => s && s.url && s.enabled !== false,
+      );
+    if (newestShared.length > use.length) {
+      void refresh();
+      return;
+    }
     if (!dedup.length) {
       toast.show('没拉到内容，检查一下源地址', 'warn');
     } else {
@@ -980,7 +999,9 @@ export default function JiaojiaoFmScreen() {
               收听源
             </Text>
             <Text style={{ color: night.cyan, fontSize: 11, flexShrink: 1 }} numberOfLines={1}>
-              {reports.length ? healthSummary(reports) : `${allSources.length} 个`}
+              {reports.length
+                ? `${allSources.length} 个 · ${healthSummary(reports)}`
+                : `${allSources.length} 个`}
             </Text>
           </View>
           {/* 刷新从搜索按钮挪到这里：搜索旁边应该是搜索，不该是刷新 */}
