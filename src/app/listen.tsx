@@ -58,11 +58,26 @@ export default function ListenScreen() {
     }
   }, [engine.playing]);
 
-  /** TA 现在是不是也在这个房间里（presence 里 surface=listen） */
-  const ROOM_ON =
-    (snapshot as unknown as {
+  /*
+   * TA 现在是不是也在这个房间里。
+   *
+   * ROOM_SURFACE_FIX（真实 bug：「我点进去加入房间，TA 那边显示我没进来」）：
+   * presence.ts 里 /listen 上报的 surface 是 **'music'**（'listen' 根本不在枚举里），
+   * 而这里以前拿 'listen' 比对，永远 false —— 所以两边都一直显示"TA 还没进来"。
+   * 现在按 'music'（兼容老的 'listen'）+ 心跳新鲜度判断。
+   */
+  const peerPresence = (
+    snapshot as unknown as {
       presence?: Partial<Record<'A' | 'B', { surface: string; at: number }>>;
-    }).presence?.[partner]?.surface === 'listen';
+    }
+  ).presence?.[partner];
+  const ROOM_ON = (() => {
+    if (!peerPresence) return false;
+    if (!(peerPresence.surface === 'music' || peerPresence.surface === 'listen')) return false;
+    const at = Number(peerPresence.at) || 0;
+    /* 心跳 150 秒没更新就当人走了（和 presence.ts 的 PRESENCE_STALE_MS 一致） */
+    return at > 0 && Date.now() - at < 150_000;
+  })();
 
   const [addOpen, setAddOpen] = useState(false);
   const [title, setTitle] = useState('');
@@ -120,7 +135,9 @@ export default function ListenScreen() {
           <View style={styles.roomChip}>
             <View style={[styles.roomDot, ROOM_ON ? styles.roomDotOn : null]} />
             <Text style={styles.roomText} numberOfLines={1}>
-              {ROOM_ON ? '房间已连接 · TA 也在听' : 'TA 还没进来 · 进来会自动跟随'}
+              {ROOM_ON
+                ? `房间已连接 · ${snapshot.members[partner].name || 'TA'} 也在听`
+                : `你在房间里 · ${snapshot.members[partner].name || 'TA'} 还没进来`}
             </Text>
           </View>
         </View>
@@ -137,8 +154,17 @@ export default function ListenScreen() {
                * 把当前曲目 + 当前进度写进共享状态，对方会跟着跳到这里。
                */
               const pos = Math.max(0, Number(engine.currentTime) || 0);
-              store.musicAction('seek', { positionSec: pos });
-              store.toast(`已同步到 ${Math.floor(pos / 60)}:${String(Math.floor(pos % 60)).padStart(2, '0')}`);
+              /*
+               * SYNC_SEND_BOTH：只发 seek 的话，对方那边如果是"暂停"状态，
+               * 引擎只会纠正进度但不回到播放，听感就是"点了同步没反应"。
+               * 这里连 play/pause 一起带上（以我这边真实状态为准）。
+               */
+              store.musicAction(engine.playing ? 'play' : 'pause', { positionSec: pos });
+              store.toast(
+                `已同步到 ${Math.floor(pos / 60)}:${String(Math.floor(pos % 60)).padStart(2, '0')}${
+                  engine.playing ? '（一起播）' : '（停在这一点）'
+                }`,
+              );
             }}
           />
           <Btn title="＋ 加一首歌" style={{ flex: 1 }} onPress={() => setAddOpen(true)} />
@@ -227,11 +253,7 @@ export default function ListenScreen() {
             const active = idx === music.index;
             const name = (track.artist || '未知歌手').trim() || '未知歌手';
             return (
-              <Pressable
-                key={track.id}
-                onPress={() => engine.selectTrack(idx)}
-                style={[styles.trackCard, active ? styles.trackCardOn : null]}
-              >
+              <View key={track.id} style={[styles.trackCard, active ? styles.trackCardOn : null]}>
                 {active ? (
                   <LinearGradient
                     colors={['rgba(255,214,203,0.85)', 'rgba(255,244,240,0.4)', 'rgba(201,166,232,0.22)']}
@@ -241,7 +263,16 @@ export default function ListenScreen() {
                     pointerEvents="none"
                   />
                 ) : null}
-                <View style={styles.coverWrap}>
+                {/*
+                 * 主区域单独一个 Pressable：以前删除键嵌在外层 Pressable 里，
+                 * 安卓上点✕经常同时触发"切歌"，删歌会顺带跳播放（用户反馈过的老毛病）。
+                 */}
+                <Pressable
+                  onPress={() => engine.selectTrack(idx)}
+                  style={styles.trackMain}
+                  hitSlop={4}
+                >
+                  <View style={styles.coverWrap}>
                   {track.cover ? (
                     <Image source={{ uri: track.cover }} style={styles.cover} />
                   ) : (
@@ -266,13 +297,14 @@ export default function ListenScreen() {
                     {name} · {track.addedBy === role ? '我' : snapshot.members[track.addedBy].name} 添加
                   </Text>
                 </View>
-                {active ? (
-                  <View style={styles.nowBadge}>
-                    <Text style={styles.nowText}>正在放</Text>
-                  </View>
-                ) : (
-                  <Text style={styles.idxText}>{idx + 1}</Text>
-                )}
+                  {active ? (
+                    <View style={styles.nowBadge}>
+                      <Text style={styles.nowText}>正在放</Text>
+                    </View>
+                  ) : (
+                    <Text style={styles.idxText}>{idx + 1}</Text>
+                  )}
+                </Pressable>
                 <Pressable
                   hitSlop={12}
                   onPress={() => store.removeMusicTrack(track.id)}
@@ -280,7 +312,7 @@ export default function ListenScreen() {
                 >
                   <Text style={{ color: color.danger, fontSize: 12 }}>✕</Text>
                 </Pressable>
-              </Pressable>
+              </View>
             );
           })
         )}
@@ -448,6 +480,8 @@ const styles = StyleSheet.create({
     borderColor: color.line,
   },
   trackCardOn: { borderColor: color.primary, backgroundColor: '#FFF7F3', overflow: 'hidden' },
+  /* 主区域：封面 + 文字 + 序号/正在放，整块可点=切到这首歌 */
+  trackMain: { flex: 1, flexDirection: 'row', alignItems: 'center' },
   coverWrap: { width: 46, height: 46 },
   cover: { width: 46, height: 46, borderRadius: 12 },
   coverFallback: {

@@ -1,5 +1,5 @@
 ﻿import AsyncStorage from '@react-native-async-storage/async-storage';
-import { useRouter } from 'expo-router';
+import { useFocusEffect, usePathname, useRouter } from 'expo-router';
 import { createAudioPlayer, setAudioModeAsync, type AudioPlayer } from 'expo-audio';
 import { claimAudioFocus, registerAudioOwner, releaseAudioFocus, unregisterAudioOwner } from '../lib/audioFocus';
 import React, { useEffect, useMemo, useRef, useState } from 'react';
@@ -27,7 +27,7 @@ import {
 } from '../core/jiaojiaoFm';
 import { Btn, Card, useToast } from '../ui/components';
 import { useApp } from '../store';
-import { mergeProgress } from '../core/jiaojiaoFm';
+import { cleanEpisodeTitle, mergeProgress } from '../core/jiaojiaoFm';
 import { night, nightFont } from '../ui/nightTheme';
 import { color, font, radius, space } from '../ui/theme';
 import { pageBg } from '../ui/theme';
@@ -47,11 +47,24 @@ const ITEMS_KEY = 'jfm_items_v1';
 /** 这一层在音频焦点登记表里的名字 */
 const FM_OWNER = 'jiaojiao-fm';
 
+/**
+ * FM 专用的深色玻璃卡。
+ *
+ * FM_CARD_DARK：全局 <Card> 在"用户设了自定义背景"时会被强制成白色磨砂
+ * （components.tsx 里 glass 分支把 tone 压成 0.3 透明叠层），而本页文字是浅色的
+ * night 主题 —— 于是「收听源状态 / 一起听提示」在自定义背景下几乎看不见。
+ * 这里自己画一张深色卡，保证任何背景上都读得清。
+ */
+function FmCard({ children }: { children: React.ReactNode }) {
+  return <View style={styles.darkCard}>{children}</View>;
+}
+
 export default function JiaojiaoFmScreen() {
   const router = useRouter();
+  const pathname = usePathname();
   const insets = useSafeAreaInsets();
   const toast = useToast();
-  const { store, snapshot } = useApp();
+  const { store, snapshot, role } = useApp();
 
   const [sources, setSources] = useState<FmSource[]>([]);
   const [items, setItems] = useState<FmItem[]>([]);
@@ -65,6 +78,20 @@ export default function JiaojiaoFmScreen() {
   const [isPlaying, setIsPlaying] = useState(false);
 
   const playerRef = useRef<AudioPlayer | null>(null);
+  /*
+   * HANDOFF_GUARD（真实 bug：「放 FM 时两个声音一起讲」）
+   *
+   * 迷你条点进播放页时，本页只是被 Stack 压在下面、并没有卸载：
+   *  - 播放页 claimAudioFocus 会把本页这一路 pause 掉（第一次）；
+   *  - 但播放页每 500ms 把进度写进空间（pushFmProgress），快照又回传给本页；
+   *  - 本页那段"跟 TA 同步"的 effect 看到 remote.playing && !isPlaying 就 p.play()，
+   *    于是本页这一路**从被暂停的位置又响起来**，和播放页那一路错位叠音。
+   *
+   * 所以交接出去之后（以及本页不在前台时），本页一律不许自己开播。
+   */
+  const handedOff = useRef(false);
+  const playingRef = useRef<FmItem | null>(null);
+  playingRef.current = playing;
   /** 已经应用过的对方操作时间戳（避免来回拉扯） */
   const syncRef = useRef(0);
   /** 换集自动跟随：默认关（防止把你的播放抢走） */
@@ -308,6 +335,90 @@ export default function JiaojiaoFmScreen() {
     };
   }, []);
 
+  /* 回到本页：解除交接锁，并把播放页停下的位置接回来（不然会跳回进播放页之前的进度） */
+  useFocusEffect(
+    React.useCallback(() => {
+      handedOff.current = false;
+      void AsyncStorage.getItem('jfm_resume_v1')
+        .then((raw) => {
+          if (!raw) return;
+          const box = JSON.parse(raw) as { audio?: string; positionSec?: number };
+          const p = playerRef.current;
+          const mine = playingRef.current;
+          if (!p || !mine || !box?.audio || box.audio !== mine.audio) return;
+          const at = Number(box.positionSec) || 0;
+          if (at > 0.5) void p.seekTo(at);
+        })
+        .catch(() => undefined);
+    }, []),
+  );
+
+
+  /** 对方（TA）现在的 FM 进度：只有"最后操作者是 TA"时才算 TA 的状态 */
+  const partnerFm = (() => {
+    const p = (
+      snapshot as unknown as {
+        fmProgress?: {
+          itemKey: string;
+          positionSec: number;
+          playing: boolean;
+          role: 'A' | 'B';
+          updatedAt: number;
+          rate: number;
+        } | null;
+      }
+    ).fmProgress;
+    return p && p.role !== role ? p : null;
+  })();
+
+  const fmtClock = (sec: number) =>
+    `${Math.floor(Math.max(0, sec) / 60)}:${String(Math.floor(Math.max(0, sec) % 60)).padStart(2, '0')}`;
+
+  /** 把"我现在这一秒"写进共享状态：TA 开着跟随便会跳过来 */
+  const syncHere = () => {
+    const p = playerRef.current;
+    if (!playing || !p) {
+      toast.show('先点一集开始听，再同步', 'warn');
+      return;
+    }
+    const at = Math.max(0, Number(p.currentTime) || 0);
+    store.pushFmProgress({ itemKey: playing.key, positionSec: at, rate: 1, playing: isPlaying });
+    toast.show(`已同步到 ${fmtClock(at)}${autoFollow ? '' : '（提醒 TA 打开跟随）'}`);
+  };
+
+  /** 跟到 TA 那一集、那一秒（顺便把跟随打开） */
+  const followPartner = () => {
+    const remote = partnerFm;
+    if (!remote) {
+      toast.show('TA 现在没在听，先让 TA 播一下', 'warn');
+      return;
+    }
+    const target = items.find((i) => i.key === remote.itemKey);
+    if (!target) {
+      toast.show('TA 听的那一集不在当前列表里（可能换了源）', 'warn');
+      return;
+    }
+    try {
+      claimAudioFocus(FM_OWNER);
+      const oldP = playerRef.current;
+      const np = createAudioPlayer({ uri: target.audio });
+      playerRef.current = np;
+      try {
+        (oldP as unknown as { remove?: () => void })?.remove?.();
+      } catch {
+        /* 忽略 */
+      }
+      void np.seekTo(Math.max(0, remote.positionSec));
+      if (remote.playing) np.play();
+      setPlaying(target);
+      setIsPlaying(remote.playing);
+      setAutoFollow(true);
+      toast.show(`已跟到 TA 的 ${fmtClock(remote.positionSec)}`);
+    } catch {
+      /* 地址失效就当没播 */
+    }
+  };
+
   const play = (item: FmItem) => {
     try {
       /*
@@ -382,6 +493,8 @@ export default function JiaojiaoFmScreen() {
    * 规则和影院一致 —— 谁后操作听谁的；偏差 > 1.5 秒才强制 seek，避免两边互相拽。
    */
   useEffect(() => {
+    /* 交接给播放页 / 本页不在前台：这一路不许再出声（见 HANDOFF_GUARD） */
+    if (handedOff.current || pathname !== '/jiaojiao-fm') return;
     const remote = (snapshot as unknown as {
       fmProgress?: { itemKey: string; positionSec: number; playing: boolean; role: 'A' | 'B'; updatedAt: number } | null;
     }).fmProgress;
@@ -392,7 +505,11 @@ export default function JiaojiaoFmScreen() {
     if (!playing || playing.key !== remote.itemKey) {
       if (!autoFollow) return;
       const target = items.find((i) => i.key === remote.itemKey);
-      if (!target) return;
+      if (!target) {
+        /* 对方听的那一集不在本机列表里（换了源/还没拉到）—— 说一声，别静默 */
+        toast.show('TA 听的那一集不在当前列表里，刷新一下收听源再试', 'warn');
+        return;
+      }
       try {
         claimAudioFocus(FM_OWNER);
         const oldP = playerRef.current;
@@ -477,7 +594,9 @@ export default function JiaojiaoFmScreen() {
     const q = query.trim().toLowerCase();
     if (!q) return albumGroups;
     return albumGroups.filter(
-      (g) => g.name.toLowerCase().includes(q) || g.items.some((i) => i.title.toLowerCase().includes(q)),
+      (g) =>
+      g.name.toLowerCase().includes(q) ||
+      g.items.some((i) => cleanEpisodeTitle(i.title).toLowerCase().includes(q)),
     );
   }, [albumGroups, query]);
 
@@ -497,6 +616,11 @@ export default function JiaojiaoFmScreen() {
     <View style={[styles.root, { backgroundColor: pageBg(night.bgDeep) }]}>
       {/* 焦焦FM 用自己的专属壁纸（bg-3），和外面的背景分开 */}
       <Aurora accent="#FFD37A" which={2} useCustom={false} />
+      {/*
+       * FM_SCRIM：本页文字是浅色的（night 主题），壁纸太亮时「收听源状态 / 一起听提示」
+       * 几乎看不见。压一层中性暗色（不是奶白，也不发黄），壁纸仍然透出来。
+       */}
+      <View pointerEvents="none" style={styles.scrim} />
       <ScrollView
         contentContainerStyle={{ padding: space.md, paddingTop: insets.top + 10, paddingBottom: 120 }}
       >
@@ -530,7 +654,7 @@ export default function JiaojiaoFmScreen() {
         </View>
 
         {/* 源状态 */}
-        <Card tone={night.glass as unknown as string}>
+        <FmCard>
           <View style={{ flexDirection: 'row', alignItems: 'center' }}>
             <Text style={[font.bodyStrong, { color: night.text, flex: 1 }]} numberOfLines={1}>
               收听源
@@ -604,7 +728,37 @@ export default function JiaojiaoFmScreen() {
           ) : (
             <Btn title="＋ 添加收听源" small onPress={() => setAdding(true)} />
           )}
-        </Card>
+        </FmCard>
+
+        {/* 一起听：把进度同步给对方 / 跟到对方（用户要求 FM 也要有"同步到一样的进度"） */}
+        <View style={{ height: 12 }} />
+        <FmCard>
+          <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+            <Text style={[font.bodyStrong, { color: night.text, flex: 1 }]} numberOfLines={1}>
+              🎧 一起听
+            </Text>
+            <Text style={{ color: autoFollow ? night.cyan : night.textDim, fontSize: 11 }}>
+              {autoFollow ? '跟随：开' : '跟随：关'}
+            </Text>
+          </View>
+          <Text style={[styles.hint, { color: 'rgba(234,244,255,0.82)' }]} numberOfLines={2}>
+            {partnerFm
+              ? `TA 正在听「${
+                  cleanEpisodeTitle(items.find((i) => i.key === partnerFm.itemKey)?.title ?? '') || '另一集'
+                }」 ${fmtClock(partnerFm.positionSec)}${partnerFm.playing ? ' · 播放中' : ' · 已暂停'}`
+              : 'TA 现在没在听。点「同步到这里」，TA 开着跟随就会跳到你这一秒。'}
+          </Text>
+          <View style={{ flexDirection: 'row', gap: 8, marginTop: 10 }}>
+            <Btn title="↻ 同步到这里" small style={{ flex: 1 }} onPress={syncHere} />
+            <Btn title="跟随 TA" small variant="soft" style={{ flex: 1 }} onPress={followPartner} />
+            <Btn
+              title={autoFollow ? '关跟随' : '开跟随'}
+              small
+              variant="ghost"
+              onPress={toggleFollow}
+            />
+          </View>
+        </FmCard>
 
         <View style={{ height: 14 }} />
 
@@ -615,12 +769,12 @@ export default function JiaojiaoFmScreen() {
             <Text style={styles.hint}>正在把声音拉进来…</Text>
           </View>
         ) : list.length === 0 ? (
-          <Card tone={night.glass as unknown as string}>
+          <FmCard>
             <Text style={[font.bodyStrong, { color: night.text }]}>焦焦FM 里还没有声音</Text>
             <Text style={styles.hint}>
               加一个收听源就能听。RSS 适合播客和有声书站，列表 JSON 适合自己整理的书单。
             </Text>
-          </Card>
+          </FmCard>
         ) : (
           openAlbum ? (
             <>
@@ -657,7 +811,7 @@ export default function JiaojiaoFmScreen() {
                               style={[styles.epRowTitle, active && { color: '#08111F', fontWeight: '700' }]}
                               numberOfLines={2}
                             >
-                              {it.title || `第 ${num} 集`}
+                              {cleanEpisodeTitle(it.title) || `第 ${num} 集`}
                             </Text>
                             {dur ? (
                               <Text style={[styles.epRowDur, active && { color: 'rgba(8,17,31,0.7)' }]}>
@@ -753,6 +907,7 @@ export default function JiaojiaoFmScreen() {
               } catch {
                 /* 忽略 */
               }
+              handedOff.current = true;
               setIsPlaying(false);
               router.push({
                 pathname: '/jiaojiao-fm-player',
@@ -768,7 +923,7 @@ export default function JiaojiaoFmScreen() {
             }}
           >
             <Text style={styles.barTitle} numberOfLines={1}>
-              {playing.title}
+              {cleanEpisodeTitle(playing.title)}
             </Text>
             <Text style={styles.barMeta} numberOfLines={1}>
               {playing.album || playing.author || '焦焦FM'}
@@ -787,6 +942,22 @@ export default function JiaojiaoFmScreen() {
 
 const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: night.bgDeep },
+  darkCard: {
+    backgroundColor: 'rgba(12,20,40,0.74)',
+    borderRadius: radius.lg,
+    borderWidth: 1,
+    borderColor: 'rgba(120,186,255,0.20)',
+    padding: 14,
+    marginBottom: 12,
+  },
+  scrim: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: 'rgba(6,12,24,0.42)',
+  },
   headerRow: { flexDirection: 'row', alignItems: 'flex-start', marginBottom: 10 },
   title: { fontSize: 22, fontWeight: '800', color: night.text },
   sub: { fontSize: 11, color: night.textDim, marginTop: 3 },

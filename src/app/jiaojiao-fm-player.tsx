@@ -1,3 +1,4 @@
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { createAudioPlayer, setAudioModeAsync } from 'expo-audio';
 import { claimAudioFocus, registerAudioOwner, releaseAudioFocus, unregisterAudioOwner } from '../lib/audioFocus';
@@ -5,6 +6,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { Image, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
+import { cleanEpisodeTitle } from '../core/jiaojiaoFm';
 import { useApp } from '../store';
 import { Ico } from '../ui/icons';
 import { night } from '../ui/nightTheme';
@@ -24,7 +26,7 @@ const SLEEPS = [0, 15, 30, 60]; // 分钟，0 = 关
 export default function JiaojiaoFmPlayerScreen() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
-  const { store } = useApp();
+  const { store, snapshot, role } = useApp();
   const params = useLocalSearchParams<{
     audio?: string;
     title?: string;
@@ -52,6 +54,8 @@ const FM_PLAYER_OWNER = 'jiaojiao-fm-player';
   const [pos, setPos] = useState(0);
   const [dur, setDur] = useState(0);
   const [speed, setSpeed] = useState(1);
+  /** 同步反馈（点一下就知道成没成） */
+  const [syncHint, setSyncHint] = useState('');
   const [sleepMin, setSleepMin] = useState(0);
   const [sleepLeft, setSleepLeft] = useState(0);
 
@@ -72,9 +76,17 @@ const FM_PLAYER_OWNER = 'jiaojiao-fm-player';
        * 原生 AudioTrack 还在，来回进出就变成多路声音叠着放。
        */
       claimAudioFocus(FM_PLAYER_OWNER);
+      /* 也登记成"能被别人暂停"的一方：一起听要出声时能把它停掉 */
+      registerAudioOwner(FM_PLAYER_OWNER, () => {
+        try {
+          playerRef.current?.pause();
+          setPlaying(false);
+        } catch {
+          /* 忽略 */
+        }
+      });
       const p = createAudioPlayer({ uri: audio });
       playerRef.current = p;
-      p.play();
       /* 从迷你条进来时带 startSec：先定位再播，避免从头再放一遍（错位回声） */
       if (startSec > 0.5) {
         try {
@@ -83,6 +95,7 @@ const FM_PLAYER_OWNER = 'jiaojiao-fm-player';
           /* 忽略 */
         }
       }
+      p.play();
       setPlaying(true);
     } catch {
       /* 地址失效就当没播 */
@@ -90,6 +103,20 @@ const FM_PLAYER_OWNER = 'jiaojiao-fm-player';
     return () => {
       const p = playerRef.current;
       playerRef.current = null;
+      /*
+       * 退出播放页：把当前位置交给列表页（jfm_resume_v1）。
+       * 不交接的话，列表页那一路还停在"进播放页之前的进度"，一回去继续播就跳回旧位置。
+       */
+      try {
+        const at = Math.max(0, Number(p?.currentTime) || 0);
+        void AsyncStorage.setItem(
+          'jfm_resume_v1',
+          JSON.stringify({ audio, positionSec: at }),
+        ).catch(() => undefined);
+      } catch {
+        /* 忽略 */
+      }
+      unregisterAudioOwner(FM_PLAYER_OWNER);
       releaseAudioFocus(FM_PLAYER_OWNER);
       try {
         p?.pause();
@@ -145,6 +172,52 @@ const FM_PLAYER_OWNER = 'jiaojiao-fm-player';
     }, 1000);
     return () => clearInterval(timer);
   }, [sleepMin]);
+
+  /** 对方（TA）现在的 FM 进度 */
+  const partnerFm = (() => {
+    const p = (
+      snapshot as unknown as {
+        fmProgress?: {
+          itemKey: string;
+          positionSec: number;
+          playing: boolean;
+          role: 'A' | 'B';
+          updatedAt: number;
+          rate: number;
+        } | null;
+      }
+    ).fmProgress;
+    return p && p.role !== role ? p : null;
+  })();
+  const sameAsPartner = !!partnerFm && partnerFm.itemKey === itemKey;
+
+  /** 把这一秒推给对方 */
+  const syncHere = () => {
+    if (!itemKey) return;
+    const p = playerRef.current;
+    const at = Math.max(0, Number(p?.currentTime) || pos);
+    store.pushFmProgress({ itemKey, positionSec: at, rate: speed, playing });
+    setSyncHint(`已同步到 ${mmss(at)}`);
+  };
+
+  /** 跟到对方那一秒（同集就直接 seek，不同集回列表页换集） */
+  const followPartner = () => {
+    if (!partnerFm) return;
+    if (!sameAsPartner) {
+      setSyncHint('TA 在听另一集，回列表点「跟随 TA」会自动换过去');
+      return;
+    }
+    try {
+      void playerRef.current?.seekTo(Math.max(0, partnerFm.positionSec));
+      if (partnerFm.playing) playerRef.current?.play();
+      else playerRef.current?.pause();
+      setPlaying(partnerFm.playing);
+      setPos(partnerFm.positionSec);
+      setSyncHint(`已跟到 TA 的 ${mmss(partnerFm.positionSec)}`);
+    } catch {
+      /* 忽略 */
+    }
+  };
 
   const toggle = () => {
     const p = playerRef.current;
@@ -223,7 +296,7 @@ const FM_PLAYER_OWNER = 'jiaojiao-fm-player';
         </View>
 
         <Text style={styles.title} numberOfLines={2}>
-          {title}
+          {cleanEpisodeTitle(title)}
         </Text>
         <Text style={styles.album} numberOfLines={1}>
           {album || '焦焦FM · 一起听书'}
@@ -249,6 +322,31 @@ const FM_PLAYER_OWNER = 'jiaojiao-fm-player';
           <Pressable onPress={() => seekBy(15)} style={styles.side}>
             <Text style={styles.sideText}>+15s</Text>
           </Pressable>
+        </View>
+
+        {/* 一起听：同步 / 跟随 */}
+        <View style={styles.syncBox}>
+          <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+            <Text style={styles.syncTitle}>🎧 一起听</Text>
+            <Text style={styles.syncMeta} numberOfLines={1}>
+              {partnerFm
+                ? `TA ${mmss(partnerFm.positionSec)}${partnerFm.playing ? ' 播放中' : ' 已暂停'}${
+                    sameAsPartner ? '' : '（另一集）'
+                  }`
+                : 'TA 现在没在听'}
+            </Text>
+          </View>
+          <View style={{ flexDirection: 'row', gap: 8, marginTop: 8 }}>
+            <Pressable onPress={syncHere} style={[styles.syncBtn, { backgroundColor: night.cyan }]}>
+              <Text style={[styles.syncBtnText, { color: '#08111F' }]}>↻ 同步到这里</Text>
+            </Pressable>
+            <Pressable onPress={followPartner} style={styles.syncBtn} disabled={!partnerFm || !sameAsPartner}>
+              <Text style={[styles.syncBtnText, { color: night.text, opacity: partnerFm ? 1 : 0.4 }]}>
+                跟随 TA
+              </Text>
+            </Pressable>
+          </View>
+          {syncHint ? <Text style={styles.hint}>{syncHint}</Text> : null}
         </View>
 
         {/* 倍速 / 睡眠定时 */}
@@ -332,6 +430,24 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
+  syncBox: {
+    marginTop: 16,
+    padding: 12,
+    borderRadius: radius.lg,
+    backgroundColor: 'rgba(255,255,255,0.06)',
+    borderWidth: 1,
+    borderColor: 'rgba(87,248,255,0.22)',
+  },
+  syncTitle: { color: night.text, fontSize: 12.5, fontWeight: '800' },
+  syncMeta: { flex: 1, textAlign: 'right', color: night.textDim, fontSize: 10.5, marginLeft: 8 },
+  syncBtn: {
+    flex: 1,
+    paddingVertical: 9,
+    borderRadius: radius.md,
+    backgroundColor: 'rgba(87,248,255,0.16)',
+    alignItems: 'center',
+  },
+  syncBtnText: { fontSize: 11.5, fontWeight: '800' },
   panel: {
     marginTop: 22,
     padding: 14,

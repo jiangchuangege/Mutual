@@ -65,6 +65,21 @@ export interface FmHealthReport {
 }
 
 /** 双人一起听的进度（谁在听、听到哪、什么速度） */
+/**
+ * 去掉片源标题里自带的集号前缀：「015_【大案纪实】…」「3.【…】」「12、…」→ 只留正文。
+ *
+ * 列表左边本来就有一列序号，标题里再来一个 "015_" 就是两套编号打架（用户反馈）。
+ * 只在"数字 + 分隔符 + 后面还有正文"时才剥，像「1998年的事」这种不会被误伤。
+ */
+export function cleanEpisodeTitle(title: string): string {
+  const raw = String(title ?? '').trim();
+  if (!raw) return raw;
+  const m = raw.match(/^(\d{1,4})\s*[_\-.．、,，:：)）\]]\s*(\S[\s\S]*)$/);
+  if (!m) return raw;
+  const rest = m[2].trim();
+  return rest || raw;
+}
+
 export interface FmProgress {
   itemKey: string;
   /** 秒 */
