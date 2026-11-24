@@ -220,33 +220,48 @@ const defs = Object.entries(COLORS)
   .join('');
 P.unshift(`<defs>${defs}</defs>`);
 
+/**
+ * 连线：线本体粗且完整可见，标签挂在**线的旁边**（横线挂上方、竖线挂右侧），
+ * 不再用胶囊盖住整条线（用户反馈"横着的箭头根本看不到"）。
+ */
 const link = (x1, y1, x2, y2, kind, label) => {
   const c = COLORS[kind];
+  const horizontal = Math.abs(y2 - y1) < Math.abs(x2 - x1);
   P.push(
-    `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="#04060C" stroke-width="12" stroke-linecap="round"/>`,
-    `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${c}" stroke-width="6" stroke-linecap="round" marker-end="url(#ar-${kind})"/>`,
+    `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="#04060C" stroke-width="13" stroke-linecap="round"/>`,
+    `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${c}" stroke-width="7" stroke-linecap="round" marker-end="url(#ar-${kind})"/>`,
   );
   if (label) {
     const mx = (x1 + x2) / 2;
     const my = (y1 + y2) / 2;
-    const w = label.length * 12.5 + 22;
-    P.push(
-      `<rect x="${mx - w / 2}" y="${my - 17}" width="${w}" height="28" rx="9" fill="#04060C" stroke="${c}" stroke-width="1.8"/>`,
-    );
-    text(mx, my + 2, label, { size: 13, fill: c, weight: 'bold' });
+    const size = 12.5;
+    const w = label.length * size * 0.98 + 20;
+    if (horizontal) {
+      /* 横线：标签放线的正上方，不挡线 */
+      P.push(
+        `<rect x="${mx - w / 2}" y="${my - 34}" width="${w}" height="24" rx="8" fill="#04060C" stroke="${c}" stroke-width="1.6" opacity="0.96"/>`,
+      );
+      text(mx, my - 17, label, { size, fill: c, weight: 'bold' });
+    } else {
+      /* 竖线：标签放线的右侧，不挡线 */
+      P.push(
+        `<rect x="${mx + 12}" y="${my - 12}" width="${w}" height="24" rx="8" fill="#04060C" stroke="${c}" stroke-width="1.6" opacity="0.96"/>`,
+      );
+      text(mx + 12 + w / 2, my + 5, label, { size, fill: c, weight: 'bold' });
+    }
   }
 };
 
 /* 用户 → App（走廊 y 224..268） */
-link(410, 210, 410, 264, 'data', '打开 App 使用');
+link(410, 210, 410, 264, 'data', '打开 App');
 /* App → 本机存储（走廊 y 824..862） */
-link(232, 806, 232, 894, 'data', '读写缓存 · 缓存先出');
+link(232, 806, 232, 894, 'data', '读写缓存');
 /* App → 外部依赖（走廊 y 824..862） */
-link(594, 806, 594, 894, 'ext', '直连源站（CMS/IPTV/RSS）');
+link(594, 806, 594, 894, 'ext', 'CMS / IPTV / RSS');
 /* App → 同步层（走廊 x 760..820） */
-link(764, 540, 814, 540, 'sync', 'RPC + WS');
+link(756, 540, 824, 540, 'sync', 'RPC + WS');
 /* 同步层 → 云服务器（走廊 x 1180..1240） */
-link(1184, 540, 1234, 540, 'sync', 'WS / HTTP');
+link(1176, 540, 1244, 540, 'sync', 'WS / HTTP');
 /* 同步层 → 关键链路（同列，表示这四条链路都用它） */
 P.push(
   `<line x1="1000" y1="806" x2="1000" y2="894" stroke="#04060C" stroke-width="12" stroke-linecap="round"/>`,
@@ -254,8 +269,8 @@ P.push(
 );
 /* 云服务器 → 内部持久化（同列示意） */
 P.push(
-  `<line x1="1600" y1="806" x2="1600" y2="894" stroke="#04060C" stroke-width="12" stroke-linecap="round"/>`,
-  `<line x1="1600" y1="806" x2="1600" y2="894" stroke="${COLORS.cloud}" stroke-width="6" stroke-linecap="round" marker-end="url(#ar-cloud)"/>`,
+  `<line x1="1470" y1="806" x2="1470" y2="894" stroke="#04060C" stroke-width="12" stroke-linecap="round"/>`,
+  `<line x1="1470" y1="806" x2="1470" y2="894" stroke="${COLORS.cloud}" stroke-width="6" stroke-linecap="round" marker-end="url(#ar-cloud)"/>`,
 );
 
 const svg = `<?xml version="1.0" encoding="UTF-8"?>\n<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">${P.join('')}</svg>\n`;
