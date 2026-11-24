@@ -71,13 +71,43 @@ export default function ListenScreen() {
       presence?: Partial<Record<'A' | 'B', { surface: string; at: number }>>;
     }
   ).presence?.[partner];
+  /*
+   * 房间是否连上（两种信号取"或"，谁先到都算数）：
+   *   ① presence 里 TA 的模块是 music（正常心跳，30 秒一次）；
+   *   ② TA 最近几分钟操作过这个队列（进页面/播放/切歌都会打 seq）——
+   *      presence 偶尔漏一拍时不至于把"人其实在"判成"没进来"。
+   */
   const ROOM_ON = (() => {
-    if (!peerPresence) return false;
-    if (!(peerPresence.surface === 'music' || peerPresence.surface === 'listen')) return false;
-    const at = Number(peerPresence.at) || 0;
-    /* 心跳 150 秒没更新就当人走了（和 presence.ts 的 PRESENCE_STALE_MS 一致） */
-    return at > 0 && Date.now() - at < 150_000;
+    const peerSurface = peerPresence?.surface;
+    const at = Number(peerPresence?.at) || 0;
+    const presenceHit =
+      (peerSurface === 'music' || peerSurface === 'listen') && at > 0 && Date.now() - at < 150_000;
+    if (presenceHit) return true;
+    const lastControlByPeer =
+      music.updatedBy !== role && music.updatedAtServerMs > 0 && Date.now() - music.updatedAtServerMs < 180_000;
+    return lastControlByPeer;
   })();
+
+  /** 对方现在在干嘛（给下面那行提示用，别只会说"没进来"） */
+  const peerWhere = (() => {
+    const s = peerPresence?.surface;
+    if (s === 'music' || s === 'listen') return '也在听歌';
+    if (s === 'fm') return '在焦焦FM';
+    if (s === 'live') return '在看电视';
+    if (s === 'cinema') return '在看电影';
+    if (s === 'games') return '在玩游戏';
+    return '在线';
+  })();
+
+  /*
+   * ROOM_BEAT_NOW：进这一页立刻把 presence 报上去一次。
+   * AppFrame 里的心跳是靠"路径变化"触发的，从首页 banner 点"过去"时路由时序有时会漏一拍，
+   * 对方就得等最多 30 秒才看到我进来了（表现就是"我明明进来了，TA 那边显示没进来"）。
+   */
+  useEffect(() => {
+    store.setPresence('music');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const [addOpen, setAddOpen] = useState(false);
   const [title, setTitle] = useState('');
@@ -137,7 +167,9 @@ export default function ListenScreen() {
             <Text style={styles.roomText} numberOfLines={1}>
               {ROOM_ON
                 ? `房间已连接 · ${snapshot.members[partner].name || 'TA'} 也在听`
-                : `你在房间里 · ${snapshot.members[partner].name || 'TA'} 还没进来`}
+                : `你在房间里 · ${snapshot.members[partner].name || 'TA'} ${
+                    peerPresence ? peerWhere : '还没进来'
+                  }`}
             </Text>
           </View>
         </View>
