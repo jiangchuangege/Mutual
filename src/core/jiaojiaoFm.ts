@@ -247,6 +247,12 @@ export function parseRss(xml: string, sourceId: string): FmItem[] {
       sourceId,
     });
   }
+
+  /*
+   * 这里**不动顺序**：XML 里怎么排就怎么交出去（解析层不猜方向、不翻转）。
+   * 真正的展示顺序由界面层 orderEpisodes() 按"标题里自带的编号"决定，
+   * 这样无论源站是正序还是倒序、有没有 pubDate，结果都一样。
+   */
   return items;
 }
 

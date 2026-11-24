@@ -70,12 +70,168 @@ function FmCard({ children }: { children: React.ReactNode }) {
   return <View style={styles.darkCard}>{children}</View>;
 }
 
+/**
+ * 给一集列表定顺序（整页 / 合集内部都用它）。
+ *
+ * EP_ORDER_NO_TIME：RSS 里经常**没有 pubDate**（喜马拉雅就是这样），
+ * 这时所有项时间戳都是 0，任何"按时间排"都等于没排，只会保留源站给的原始顺序；
+ * 而源站又是"最新在前"的 → 片头被排到最后一集、「案3」跑到「案1」前面（用户截图）。
+ * 所以：只要有时间就按时间正序；全都没时间就把原始顺序整体反过来。
+ */
+function orderEpisodes<T extends { publishedAt?: number; title?: string }>(items: T[]): T[] {
+  /*
+   * EP_TITLE_NUMBER：**只认标题里自带的编号**，不再猜时间、也不再整体翻转。
+   *
+   * 实测数据（喜马拉雅专辑）就是这样：
+   *   316_大案纪实来袭！精彩片头！
+   *   315_【大案纪实】辽宁省昌图县案1
+   *   …
+   *   001_【大案纪实】轰动北京的阉割狂
+   * 也就是"编号越小越早，XML 里是倒着排的"。
+   *
+   * 规则（对新加的源同样适用，不写死任何专辑）：
+   *   1. 取标题开头的编号（015_ / 第15集 / 15、…）当**全局顺序**；
+   *   2. 同一个系列（把数字抹掉当键，如「辽宁省昌图县案」）内部，再按标题里的
+   *      最后一个数字排（案1→案2、4-1→4-4），并让 上/中/下 = 1/2/3；
+   *   3. 「片头 / 序章 / 开场」永远最前；
+   *   4. 系列之间按该系列里**最小**的编号定位（所以昌图县即使编号倒着写，也整体在它该在的位置）。
+   * 没有编号的源：保持 XML 原顺序（不再翻转）。
+   */
+  const seriesKey = (title: string) =>
+    String(title ?? '')
+      .replace(/^\s*\d{1,4}\s*[_\-.．、:：]\s*/, '')
+      .replace(/\d+/g, '#')
+      .replace(/[上中下]\s*(?:集|篇|部)?\s*$/, '')
+      .trim();
+
+  const leadNum = (title: string): number => {
+    const s = String(title ?? '').trim();
+    const m =
+      /^(\d{1,4})\s*[_\-.．、:：]/.exec(s) ??
+      /第\s*(\d{1,4})\s*[集期话]/.exec(s) ??
+      /^(\d{1,4})\s+/.exec(s);
+    return m ? Number(m[1]) : Number.NaN;
+  };
+
+  const innerNum = (title: string): number => {
+    const s = String(title ?? '');
+    const pair = /(\d{1,3})\s*[-_．.]\s*(\d{1,3})/.exec(s);
+    if (pair) return Number(pair[1]) * 100 + Number(pair[2]);
+    const an = /案\s*(\d{1,3})/.exec(s);
+    if (an) return Number(an[1]);
+    const all = [...s.matchAll(/\d{1,4}/g)].map((m) => Number(m[0]));
+    const last = all.length ? all[all.length - 1] : Number.NaN;
+    const part = /[上中下]\s*(?:集|篇|部)?\s*$/.exec(s)?.[0]?.trim().charAt(0);
+    if (part === '上') return Number.NaN;
+    if (part === '中') return Number.NaN;
+    if (part === '下') return Number.NaN;
+    return last;
+  };
+
+  const partOrd = (title: string): number => {
+    const tail = /[（(【\[]?\s*([上中下])\s*[)）】\]]?\s*(?:集|篇|部)?$/.exec(
+      String(title ?? '').trim(),
+    )?.[1];
+    return tail === '上' ? 1 : tail === '中' ? 2 : tail === '下' ? 3 : 0;
+  };
+
+  const isIntro = (title: string) => /片头|序章|开场|前言|发刊词/.test(String(title ?? ''));
+
+  /** 每个系列的最小全局编号（决定这一组落在什么位置） */
+  const groupLead = new Map<string, number>();
+  for (const it of items) {
+    const k = seriesKey(String(it.title ?? ''));
+    const n = leadNum(String(it.title ?? ''));
+    if (!Number.isFinite(n)) continue;
+    const cur = groupLead.get(k);
+    if (cur === undefined || n < cur) groupLead.set(k, n);
+  }
+
+  const out = items.slice();
+  out.sort((a, b) => {
+    const at = String(a.title ?? '');
+    const bt = String(b.title ?? '');
+    /** 有编号的在前，片头在最前 */
+    const introA = isIntro(at);
+    const introB = isIntro(bt);
+    if (introA !== introB) return introA ? -1 : 1;
+
+    const la = Number.isFinite(leadNum(at));
+    const lb = Number.isFinite(leadNum(bt));
+    if (la !== lb) return la ? -1 : 1;
+
+    const ka = seriesKey(at);
+    const kb = seriesKey(bt);
+    if (ka !== kb) {
+      const ga = groupLead.get(ka) ?? Number.POSITIVE_INFINITY;
+      const gb = groupLead.get(kb) ?? Number.POSITIVE_INFINITY;
+      if (ga !== gb) return ga - gb;
+      return ka < kb ? -1 : 1;
+    }
+    /* 同一系列：先看标题里的局部编号（案1/4-2…），再看 上/中/下，最后看全局编号 */
+    const ia = innerNum(at);
+    const ib = innerNum(bt);
+    if (Number.isFinite(ia) && Number.isFinite(ib) && ia !== ib) return ia - ib;
+    const pa = partOrd(at);
+    const pb = partOrd(bt);
+    if (pa !== pb) return pa - pb;
+    const na = leadNum(at);
+    const nb = leadNum(bt);
+    if (Number.isFinite(na) && Number.isFinite(nb) && na !== nb) return na - nb;
+    return (a.publishedAt || 0) - (b.publishedAt || 0);
+  });
+  return out;
+}
+
+
+/**
+ * 集排序（整页和合集内部必须用同一个比较器）。
+ *
+ * EP_ORDER_FULL：只按时间排不够 —— 同一批「上/中/下」在 RSS 里往往时间戳相同
+ * （甚至没有 pubDate），这时会退回源站给的原始顺序，而源站常常是**新的在前**，
+ * 于是「下」排到「中」前面、「上」排到最后（用户截图就是这个）。
+ * 现在：时间正序 → 上(1)中(2)下(3) → 原始顺序。
+ */
+function compareEpisodes(a: { publishedAt?: number; title?: string }, b: { publishedAt?: number; title?: string }): number {
+  const at = a.publishedAt || 0;
+  const bt = b.publishedAt || 0;
+  if (at !== bt) return at - bt;
+  const aw = partWeight(String(a.title ?? ''));
+  const bw = partWeight(String(b.title ?? ''));
+  return aw - bw;
+}
+
 /** 「…上 / …中 / …下」的排序权重：同一时间戳时也要保证 上→中→下 */
+/**
+ * 从标题里认「这是第几集」。
+ *
+ * EP_ORDINAL：不同专辑的发布时间顺序是乱的（有的源先发第 3 集再发第 1 集，
+ * 片头还常常是后来补传的、时间戳最新），光按时间排总有一批会反。
+ * 这里认几种常见写法：
+ *   「…案12」「…第12集」「12-3」「12_3」→ 12 / 1203
+ *   「…片头」「…序章」「…开场」→ -1（永远排最前）
+ * 认不出来就给一个大数（排在编号集之后）。
+ */
+function epOrdinal(title: string): number {
+  const s = String(title ?? '').trim();
+  if (/片头|序章|开场|前言|发刊词/.test(s)) return -1;
+  const pair = /(\d{1,3})\s*[-_．.]\s*(\d{1,3})/.exec(s);
+  if (pair) return Number(pair[1]) * 100 + Number(pair[2]);
+  const ep = /第\s*(\d{1,4})\s*[集期话]/.exec(s);
+  if (ep) return Number(ep[1]);
+  const an = /案\s*(\d{1,4})/.exec(s);
+  if (an) return Number(an[1]);
+  const head = /^(\d{1,4})\s*[_\-.．、]/.exec(s);
+  if (head) return Number(head[1]);
+  return 99999;
+}
+
 function partWeight(title: string): number {
-  const s = String(title ?? '');
-  if (/[（(]?\s*[上]\)?\s*$/.test(s)) return 1;
-  if (/[（(]?\s*[中]\)?\s*$/.test(s)) return 2;
-  if (/[（(]?\s*[下]\)?\s*$/.test(s)) return 3;
+  const s = String(title ?? '').replace(/\s+$/, '');
+  const tail = /[（(【\[]?\s*([上中下])\s*[)）】\]]?\s*(?:集|篇|部)?$/.exec(s)?.[1];
+  if (tail === '上') return 1;
+  if (tail === '中') return 2;
+  if (tail === '下') return 3;
   return 0;
 }
 
@@ -288,7 +444,7 @@ export default function JiaojiaoFmScreen() {
       const seenLive = new Set<string>();
       const dedupLive = liveItems.filter((i) => (seenLive.has(i.key) ? false : (seenLive.add(i.key), true)));
       dedupLive.sort((a, b) => b.publishedAt - a.publishedAt);
-      setItems(dedupLive);
+      setItems(orderEpisodes(dedupLive));
       setReports([...liveReports]);
     };
     const results = await Promise.all(
@@ -377,16 +533,11 @@ export default function JiaojiaoFmScreen() {
      * 用户反馈「7 是下、5 才是上，上应该在上面」—— 以前是**倒序**（新的在前），
      * 于是「…下」排到「…上」前面。听书/连载要的是第 1 集在上，所以改成正序。
      */
-    dedup.sort((a, b) => {
-      const at = a.publishedAt || 0;
-      const bt = b.publishedAt || 0;
-      if (at !== bt) return at - bt;
-      return partWeight(a.title) - partWeight(b.title);
-    });
-    setItems(dedup);
+    const ordered = orderEpisodes(dedup);
+    setItems(ordered);
     // 存一份到本机：下次进页面先显示这个（不会因为网络慢就变成"还没有声音"）
     const cacheBox: FmItemsCache = {
-      items: dedup.slice(0, 1200),
+      items: orderEpisodes(dedup).slice(0, 1200),
       at: Date.now(),
       sourceKey: use.map((s) => s.url).join('|'),
     };
@@ -745,8 +896,8 @@ export default function JiaojiaoFmScreen() {
         map.set(name, { name, cover: it.cover, items: [it], latest: it.publishedAt });
       }
     }
-    for (const g of map.values()) {
-      g.items.sort((a, b) => (a.publishedAt || 0) - (b.publishedAt || 0));
+    for (const [name, g] of map.entries()) {
+      map.set(name, { ...g, items: orderEpisodes(g.items) });
     }
     return [...map.values()].sort((a, b) => b.latest - a.latest);
   }, [visibleItems]);
