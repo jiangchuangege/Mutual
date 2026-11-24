@@ -331,7 +331,12 @@ export function useMusicEngine({
       if (music.seq > appliedSeqRef.current) {
         appliedSeqRef.current = music.seq;
         const partnerDriving = music.updatedBy !== role;
-        if (partnerDriving && !intentRef.current && now - lastSeekFixRef.current > 1500) {
+        /*
+         * SEEK_COOLDOWN：刚 seek 完的 4 秒内不再纠正，
+         * 并且**缓冲中/卡住时一律不纠**（否则每纠一次就重新缓冲，永远出不来）。
+         */
+        const busy = isBuffering;
+        if (partnerDriving && !intentRef.current && !busy && now - lastSeekFixRef.current > 4000) {
           const target = musicTargetPosition(
             {
               action: music.action === 'play' ? 'play' : 'pause',
@@ -340,7 +345,7 @@ export function useMusicEngine({
             },
             serverNow,
           );
-          if (shouldSeek(cur, target)) {
+          if (shouldSeek(cur, target, 2.5)) {
             lastSeekFixRef.current = now;
             void p.seekTo(Math.max(0, target)).catch(() => undefined);
           }
@@ -360,7 +365,15 @@ export function useMusicEngine({
       const now = Date.now();
       if (now - beatRef.current < 5000) return;
       beatRef.current = now;
-      onAction('seek', { positionSec: Math.max(0, p.currentTime ?? 0) });
+      const local = Math.max(0, Number(p.currentTime) || 0);
+      /*
+       * HEARTBEAT_ON_DRIFT：服务端那份"应该到哪了"和本地实际差得不多就别发，
+       * 省掉一次没必要的 seq 递增（对方会因为 seq 变化再纠一次）。
+       */
+      const elapsed = Math.max(0, (now - (music.updatedAtServerMs || now)) / 1000);
+      const expected = Math.max(0, (music.positionSec || 0) + elapsed);
+      if (Math.abs(local - expected) < 2.5) return;
+      onAction('seek', { positionSec: local });
     }, 1000);
     return () => clearInterval(timer);
   }, [music.updatedBy, music.action, role, onAction]);

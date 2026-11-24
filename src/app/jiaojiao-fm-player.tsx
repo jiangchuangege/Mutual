@@ -3,7 +3,7 @@ import { useLocalSearchParams, useRouter } from 'expo-router';
 import { createAudioPlayer, setAudioModeAsync } from 'expo-audio';
 import { claimAudioFocus, registerAudioOwner, releaseAudioFocus, unregisterAudioOwner } from '../lib/audioFocus';
 import React, { useEffect, useRef, useState } from 'react';
-import { Image, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { Image, PanResponder, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { cleanEpisodeTitle } from '../core/jiaojiaoFm';
@@ -219,6 +219,51 @@ const FM_PLAYER_OWNER = 'jiaojiao-fm-player';
     }
   };
 
+  /*
+   * 可拖动的进度条（用户要求"能拖动"）。
+   *
+   * 用手指按住滑条任意位置就开始拖：拖动过程中只更新本地显示（dragPos），
+   * 松手那一下才真正 seekTo —— 边拖边 seek 会把音频搞得一直在缓冲。
+   */
+  const [dragging, setDragging] = useState(false);
+  const [dragPos, setDragPos] = useState(0);
+  const barWidthRef = useRef(1);
+
+  const ratioFromX = (x: number) => {
+    const w = Math.max(1, barWidthRef.current);
+    return Math.max(0, Math.min(1, x / w));
+  };
+
+  const dragSeek = (x: number, commit: boolean) => {
+    if (!(dur > 0)) return;
+    const target = ratioFromX(x) * dur;
+    setDragPos(target);
+    if (!commit) return;
+    try {
+      void playerRef.current?.seekTo(target);
+      setPos(target);
+    } catch {
+      /* 忽略 */
+    }
+  };
+
+  const barPan = useRef(
+    PanResponder.create({
+      onStartShouldSetPanResponder: () => true,
+      onMoveShouldSetPanResponder: () => true,
+      onPanResponderGrant: (e) => {
+        setDragging(true);
+        dragSeek(e.nativeEvent.locationX, false);
+      },
+      onPanResponderMove: (e) => dragSeek(e.nativeEvent.locationX, false),
+      onPanResponderRelease: (e) => {
+        dragSeek(e.nativeEvent.locationX, true);
+        setDragging(false);
+      },
+      onPanResponderTerminate: () => setDragging(false),
+    }),
+  ).current;
+
   const toggle = () => {
     const p = playerRef.current;
     if (!p) return;
@@ -302,12 +347,33 @@ const FM_PLAYER_OWNER = 'jiaojiao-fm-player';
           {album || '焦焦FM · 一起听书'}
         </Text>
 
-        {/* 进度条 */}
-        <View style={styles.barTrack}>
-          <View style={[styles.barFill, { width: `${progress * 100}%` }]} />
+        {/* 进度条：可以按住拖（松手才 seek） */}
+        <View
+          style={styles.barTouch}
+          onLayout={(e) => {
+            barWidthRef.current = Math.max(1, e.nativeEvent.layout.width);
+          }}
+          {...barPan.panHandlers}
+        >
+          <View style={styles.barTrack}>
+            <View
+              style={[
+                styles.barFill,
+                {
+                  width: `${(dragging && dur > 0 ? dragPos / dur : progress) * 100}%`,
+                },
+              ]}
+            />
+            <View
+              style={[
+                styles.barKnob,
+                { left: `${(dragging && dur > 0 ? dragPos / dur : progress) * 100}%` },
+              ]}
+            />
+          </View>
         </View>
         <View style={styles.timeRow}>
-          <Text style={styles.time}>{mmss(pos)}</Text>
+          <Text style={styles.time}>{mmss(dragging ? dragPos : pos)}</Text>
           <Text style={styles.time}>{dur > 0 ? mmss(dur) : '--:--'}</Text>
         </View>
 
@@ -404,6 +470,18 @@ const styles = StyleSheet.create({
   coverFallback: { alignItems: 'center', justifyContent: 'center' },
   title: { color: night.text, fontSize: 17, fontWeight: '800', textAlign: 'center', marginTop: 14 },
   album: { color: night.textDim, fontSize: 12, textAlign: 'center', marginTop: 4 },
+  barTouch: { paddingVertical: 12, marginTop: 6 },
+  barKnob: {
+    position: 'absolute',
+    top: -4,
+    width: 16,
+    height: 16,
+    borderRadius: 8,
+    marginLeft: -8,
+    backgroundColor: '#FFFFFF',
+    borderWidth: 3,
+    borderColor: night.cyan,
+  },
   barTrack: {
     height: 4,
     borderRadius: 2,

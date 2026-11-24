@@ -70,9 +70,9 @@ export function musicTargetPosition(
 /** 偏差超过这个秒数才值得跳一下（否则每几百毫秒都在 seek，反而卡） */
 export const DRIFT_TOLERANCE_SEC = 1.5;
 
-export function shouldSeek(currentSec: number, targetSec: number): boolean {
+export function shouldSeek(currentSec: number, targetSec: number, tolerance = 1.5): boolean {
   if (!Number.isFinite(currentSec) || !Number.isFinite(targetSec)) return false;
-  return Math.abs(currentSec - targetSec) > DRIFT_TOLERANCE_SEC;
+  return Math.abs(currentSec - targetSec) > tolerance;
 }
 
 /** 建立一个意图窗口 */

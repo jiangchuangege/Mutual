@@ -80,108 +80,19 @@ function FmCard({ children }: { children: React.ReactNode }) {
  */
 function orderEpisodes<T extends { publishedAt?: number; title?: string }>(items: T[]): T[] {
   /*
-   * EP_TITLE_NUMBER：**只认标题里自带的编号**，不再猜时间、也不再整体翻转。
+   * EP_SOURCE_ORDER：**完全照抄源里的顺序**，一条都不动。
    *
-   * 实测数据（喜马拉雅专辑）就是这样：
-   *   316_大案纪实来袭！精彩片头！
-   *   315_【大案纪实】辽宁省昌图县案1
-   *   …
-   *   001_【大案纪实】轰动北京的阉割狂
-   * 也就是"编号越小越早，XML 里是倒着排的"。
-   *
-   * 规则（对新加的源同样适用，不写死任何专辑）：
-   *   1. 取标题开头的编号（015_ / 第15集 / 15、…）当**全局顺序**；
-   *   2. 同一个系列（把数字抹掉当键，如「辽宁省昌图县案」）内部，再按标题里的
-   *      最后一个数字排（案1→案2、4-1→4-4），并让 上/中/下 = 1/2/3；
-   *   3. 「片头 / 序章 / 开场」永远最前；
-   *   4. 系列之间按该系列里**最小**的编号定位（所以昌图县即使编号倒着写，也整体在它该在的位置）。
-   * 没有编号的源：保持 XML 原顺序（不再翻转）。
+   * 用户原话："下次添加源后拉取到的列表，和源接口里的列表一模一样。"
+   * 之前按时间/编号/上中下各种猜，结果每个专辑总有几处和源站不一样，
+   * 反而让人以为"又搞反了"。现在：
+   *   · 解析层不动顺序（parseRss 直接返回 XML 里的 item 次序）；
+   *   · 这里也不再重排，只做一次浅拷贝（避免外部修改原数组）。
+   * 想按编号排的话，源站自己已经排好了 —— 我们和它保持一致。
    */
-  const seriesKey = (title: string) =>
-    String(title ?? '')
-      .replace(/^\s*\d{1,4}\s*[_\-.．、:：]\s*/, '')
-      .replace(/\d+/g, '#')
-      .replace(/[上中下]\s*(?:集|篇|部)?\s*$/, '')
-      .trim();
-
-  const leadNum = (title: string): number => {
-    const s = String(title ?? '').trim();
-    const m =
-      /^(\d{1,4})\s*[_\-.．、:：]/.exec(s) ??
-      /第\s*(\d{1,4})\s*[集期话]/.exec(s) ??
-      /^(\d{1,4})\s+/.exec(s);
-    return m ? Number(m[1]) : Number.NaN;
-  };
-
-  const innerNum = (title: string): number => {
-    const s = String(title ?? '');
-    const pair = /(\d{1,3})\s*[-_．.]\s*(\d{1,3})/.exec(s);
-    if (pair) return Number(pair[1]) * 100 + Number(pair[2]);
-    const an = /案\s*(\d{1,3})/.exec(s);
-    if (an) return Number(an[1]);
-    const all = [...s.matchAll(/\d{1,4}/g)].map((m) => Number(m[0]));
-    const last = all.length ? all[all.length - 1] : Number.NaN;
-    const part = /[上中下]\s*(?:集|篇|部)?\s*$/.exec(s)?.[0]?.trim().charAt(0);
-    if (part === '上') return Number.NaN;
-    if (part === '中') return Number.NaN;
-    if (part === '下') return Number.NaN;
-    return last;
-  };
-
-  const partOrd = (title: string): number => {
-    const tail = /[（(【\[]?\s*([上中下])\s*[)）】\]]?\s*(?:集|篇|部)?$/.exec(
-      String(title ?? '').trim(),
-    )?.[1];
-    return tail === '上' ? 1 : tail === '中' ? 2 : tail === '下' ? 3 : 0;
-  };
-
-  const isIntro = (title: string) => /片头|序章|开场|前言|发刊词/.test(String(title ?? ''));
-
-  /** 每个系列的最小全局编号（决定这一组落在什么位置） */
-  const groupLead = new Map<string, number>();
-  for (const it of items) {
-    const k = seriesKey(String(it.title ?? ''));
-    const n = leadNum(String(it.title ?? ''));
-    if (!Number.isFinite(n)) continue;
-    const cur = groupLead.get(k);
-    if (cur === undefined || n < cur) groupLead.set(k, n);
-  }
-
-  const out = items.slice();
-  out.sort((a, b) => {
-    const at = String(a.title ?? '');
-    const bt = String(b.title ?? '');
-    /** 有编号的在前，片头在最前 */
-    const introA = isIntro(at);
-    const introB = isIntro(bt);
-    if (introA !== introB) return introA ? -1 : 1;
-
-    const la = Number.isFinite(leadNum(at));
-    const lb = Number.isFinite(leadNum(bt));
-    if (la !== lb) return la ? -1 : 1;
-
-    const ka = seriesKey(at);
-    const kb = seriesKey(bt);
-    if (ka !== kb) {
-      const ga = groupLead.get(ka) ?? Number.POSITIVE_INFINITY;
-      const gb = groupLead.get(kb) ?? Number.POSITIVE_INFINITY;
-      if (ga !== gb) return ga - gb;
-      return ka < kb ? -1 : 1;
-    }
-    /* 同一系列：先看标题里的局部编号（案1/4-2…），再看 上/中/下，最后看全局编号 */
-    const ia = innerNum(at);
-    const ib = innerNum(bt);
-    if (Number.isFinite(ia) && Number.isFinite(ib) && ia !== ib) return ia - ib;
-    const pa = partOrd(at);
-    const pb = partOrd(bt);
-    if (pa !== pb) return pa - pb;
-    const na = leadNum(at);
-    const nb = leadNum(bt);
-    if (Number.isFinite(na) && Number.isFinite(nb) && na !== nb) return na - nb;
-    return (a.publishedAt || 0) - (b.publishedAt || 0);
-  });
-  return out;
+  return items.slice();
 }
+
+
 
 
 /**
@@ -609,6 +520,14 @@ export default function JiaojiaoFmScreen() {
     };
   }, []);
 
+  /* REFRESH_ON_FOCUS：从「收听源」页回来时，源可能已经变了，立刻重拉一遍 */
+  useFocusEffect(
+    React.useCallback(() => {
+      void refresh();
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []),
+  );
+
   /* 回到本页：解除交接锁，并把播放页停下的位置接回来（不然会跳回进播放页之前的进度） */
   useFocusEffect(
     React.useCallback(() => {
@@ -992,84 +911,25 @@ export default function JiaojiaoFmScreen() {
           </Pressable>
         </View>
 
-        {/* 源状态 */}
-        <FmCard>
-          <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-            <Text style={[font.bodyStrong, { color: night.text, flex: 1 }]} numberOfLines={1}>
-              收听源
-            </Text>
-            <Text style={{ color: night.cyan, fontSize: 11, flexShrink: 1 }} numberOfLines={1}>
-              {reports.length
-                ? `${allSources.length} 个 · ${healthSummary(reports)}`
-                : `${allSources.length} 个`}
-            </Text>
-          </View>
-          {/* 刷新从搜索按钮挪到这里：搜索旁边应该是搜索，不该是刷新 */}
-          <View style={{ alignItems: 'flex-end', marginTop: 8 }}>
-            <Pressable onPress={() => void refresh()} hitSlop={8} style={styles.srcRefreshBtn}>
-              <Text style={styles.srcRefreshText}>{loading ? '刷新中…' : '↻ 刷新'}</Text>
-            </Pressable>
-          </View>
-          {allSources.length === 0 ? (
-            <Text style={styles.hint}>还没有收听源。支持 音频直链 / 播客 RSS / 列表 JSON。</Text>
-          ) : (
-            allSources.map((s) => {
-              const rep = reports.find((r) => r.url === s.url);
-              const tone =
-                !rep || rep.status === 'ok' ? night.cyan : rep.status === 'slow' ? '#FFD37A' : '#FF6B6B';
-              return (
-                <View key={s.id} style={styles.srcRow}>
-                  <View style={[styles.dot, { backgroundColor: tone }]} />
-                  <View style={{ flex: 1 }}>
-                    <Text style={[styles.srcName]} numberOfLines={1}>
-                      {s.name}
-                    </Text>
-                    <Text style={styles.srcMeta} numberOfLines={1}>
-                      {s.kind} · {rep ? `${rep.status === 'ok' ? '正常' : rep.status === 'slow' ? '慢' : '坏'} · ${rep.count} 条 · ${rep.ms}ms` : '未检测'}
-                      {rep?.error ? ` · ${rep.error}` : ''}
-                    </Text>
-                  </View>
-                  <Pressable onPress={() => removeAnySource(s)} hitSlop={8}>
-                    <Text style={{ color: night.textFaint, fontSize: 12 }}>删除</Text>
-                  </Pressable>
-                </View>
-              );
-            })
-          )}
-          {failed.length > 0 ? (
-            <Text style={[styles.hint, { color: '#FF6B6B' }]}>
-              {failed.length} 个源失效，点「刷新」重试或删掉它
-            </Text>
-          ) : null}
-          <View style={{ height: 8 }} />
-          {adding ? (
-            <>
-              <TextInput
-                value={name}
-                onChangeText={setName}
-                placeholder="给它起个名字（可不填）"
-                placeholderTextColor={night.textFaint}
-                style={styles.input}
-              />
-              <View style={{ height: 6 }} />
-              <TextInput
-                value={url}
-                onChangeText={setUrl}
-                placeholder="https://…（RSS / JSON / mp3 直链）"
-                placeholderTextColor={night.textFaint}
-                autoCapitalize="none"
-                style={styles.input}
-              />
-              <View style={{ height: 8 }} />
-              <View style={{ flexDirection: 'row', gap: 8 }}>
-                <Btn title="加入" small onPress={addSource} />
-                <Btn title="取消" small variant="ghost" onPress={() => setAdding(false)} />
-              </View>
-            </>
-          ) : (
-            <Btn title="＋ 添加收听源" small onPress={() => setAdding(true)} />
-          )}
-        </FmCard>
+        {/* 收听源：只剩一行状态 + 入口，管理搬到独立页面（用户嫌这里碍眼） */}
+        <Pressable
+          onPress={() => router.push('/jiaojiao-fm-sources')}
+          style={styles.srcBar}
+        >
+          <Text style={styles.srcBarDot}>🎙</Text>
+          <Text style={styles.srcBarText} numberOfLines={1}>
+            收听源 · {allSources.length} 个
+            {reports.length
+              ? ` · ${healthSummary(reports)}`
+              : failed.length > 0
+                ? ` · ${failed.length} 个异常`
+                : ''}
+          </Text>
+          <Pressable onPress={() => void refresh()} hitSlop={8} style={styles.srcBarBtn}>
+            <Text style={styles.srcBarBtnText}>{loading ? '刷新中…' : '刷新'}</Text>
+          </Pressable>
+          <Text style={styles.srcBarArrow}>›</Text>
+        </Pressable>
 
         {/* 一起听：把进度同步给对方 / 跟到对方（用户要求 FM 也要有"同步到一样的进度"） */}
         <View style={{ height: 12 }} />
@@ -1291,6 +1151,29 @@ const styles = StyleSheet.create({
     padding: 14,
     marginBottom: 12,
   },
+  srcBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(12,20,40,0.74)',
+    borderRadius: radius.pill,
+    borderWidth: 1,
+    borderColor: 'rgba(120,186,255,0.20)',
+    paddingLeft: 12,
+    paddingRight: 8,
+    paddingVertical: 9,
+    marginBottom: 12,
+  },
+  srcBarDot: { fontSize: 12, marginRight: 6 },
+  srcBarText: { flex: 1, color: night.text, fontSize: 11.5 },
+  srcBarBtn: {
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: radius.pill,
+    backgroundColor: 'rgba(87,248,255,0.92)',
+    marginLeft: 6,
+  },
+  srcBarBtnText: { color: '#08111F', fontSize: 10.5, fontWeight: '800' },
+  srcBarArrow: { color: night.textDim, fontSize: 16, marginLeft: 4 },
   scrim: {
     position: 'absolute',
     top: 0,
