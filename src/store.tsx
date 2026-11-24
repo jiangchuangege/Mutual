@@ -188,6 +188,14 @@ export class AppStore {
   private activityAnnounced = new Set<string>();
   /** 本地模式下也兜住，避免同一批动态弹两次 */
   private activityWatchReady = false;
+  /**
+   * 有没有拿到过**服务端**的投影。
+   *
+   * FIRST_SNAPSHOT_GATE：快照默认值里 boundAt 是 null，于是"刚打开 App、
+   * 服务端还没回包"的那一小段时间，首页会先渲染成「还没有建立双人空间」——
+   * 用户每次冷启动都能看到"我们没绑定"的假消息。现在没拿到快照前不进那个分支。
+   */
+  private snapshotReady = false;
   /** 当前挂在界面上的"TA 刚做了什么"提示框（需要点一下才消失） */
   private activityNotice: ActivityItem | null = null;
   /** 老版本 file:// 头像只尝试迁一次服务器，避免死循环 */
@@ -1058,6 +1066,7 @@ export class AppStore {
         void this.migrateLocalAvatar();
       }
     }
+    this.snapshotReady = true;
     this.announcePartnerActivity(projected);
     this.pushSystemNotifications(projected);
     this.bump();
@@ -1718,6 +1727,11 @@ export class AppStore {
     this.activitySeenAt = newest;
     void prefSetNumber(ACTIVITY_SEEN_KEY, newest);
     this.bump();
+  }
+
+  /** 是否已经拿到过服务端快照（没有就别信 boundAt === null） */
+  get serverSnapshotReady(): boolean {
+    return this.snapshotReady;
   }
 
   /** 账号是不是已经绑定成双人空间了 */

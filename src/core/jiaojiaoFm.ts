@@ -127,6 +127,29 @@ function tag(xml: string, name: string): string {
 }
 
 /** 取所有同名标签（ITEMS 用） */
+/**
+ * 只取出前 limit 个 <item>…</item>，扫够就停。
+ *
+ * FM_RSS_SCAN：以前用 tagAll 把 4MB 的 RSS 整篇跑一遍正则、再 slice(0,400)，
+ * 白扫 1000 多条（喜马拉雅一个专辑 1494 集）—— 模拟器上要 30 多秒，
+ * 期间 JS 线程被占住，界面一直"正在把声音拉进来"。现在扫够 400 条直接跳出。
+ */
+function itemBlocksUpTo(xml: string, limit: number): string[] {
+  const out: string[] = [];
+  if (limit <= 0) return out;
+  let from = 0;
+  for (;;) {
+    const open = xml.indexOf('<item', from);
+    if (open < 0) break;
+    const close = xml.indexOf('</item>', open);
+    if (close < 0) break;
+    out.push(xml.slice(open, close));
+    if (out.length >= limit) break;
+    from = close + 7;
+  }
+  return out;
+}
+
 function tagAll(xml: string, name: string): string[] {
   const re = new RegExp(`<${name}(?:\\s[^>]*)?>([\\s\\S]*?)</${name}>`, 'gi');
   const out: string[] = [];
@@ -181,6 +204,19 @@ export function itemKey(audio: string): string {
 }
 
 /** 解析播客 RSS → 条目列表 */
+/**
+ * 单个源最多收多少条。
+ *
+ * FM_PARSE_CAP：喜马拉雅那种 RSS 一个专辑 1494 集、单条描述几千字，
+ * 一次全解析在模拟器上要 36 秒（真机也要好几秒），期间 JS 线程被占住、
+ * 定时器都不走，界面就"一直正在把声音拉进来"。
+ * 只取前 400 条：够听、解析量掉到 1/4 以下，翻页/搜索也更快。
+ */
+export const MAX_FM_ITEMS_PER_SOURCE = 400;
+
+/** 简介再长也没人读，截断后去掉标签（省一大截解析时间） */
+const SUMMARY_CLIP = 600;
+
 export function parseRss(xml: string, sourceId: string): FmItem[] {
   const body = String(xml ?? '');
   const channelXml = /<channel[^>]*>([\s\S]*?)<\/channel>/i.exec(body)?.[1] ?? body;
@@ -191,7 +227,7 @@ export function parseRss(xml: string, sourceId: string): FmItem[] {
     '';
 
   const items: FmItem[] = [];
-  for (const raw of tagAll(channelXml, 'item')) {
+  for (const raw of itemBlocksUpTo(channelXml, MAX_FM_ITEMS_PER_SOURCE)) {
     const audio = enclosureUrl(raw);
     if (!audio || !AUDIO_EXT.test(audio)) continue;
     const title = tag(raw, 'title') || '未命名';
@@ -206,7 +242,7 @@ export function parseRss(xml: string, sourceId: string): FmItem[] {
       cover: cover ? decodeEntities(cover) : null,
       audio,
       duration: parseDuration(tag(raw, 'itunes:duration')),
-      summary: plainText(tag(raw, 'description') || tag(raw, 'summary') || ''),
+      summary: plainText((tag(raw, 'description') || tag(raw, 'summary') || '').slice(0, SUMMARY_CLIP)),
       publishedAt: published,
       sourceId,
     });

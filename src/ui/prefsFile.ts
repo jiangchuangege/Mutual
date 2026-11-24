@@ -31,7 +31,7 @@ const DIR = `${FileSystemLegacy.documentDirectory ?? FileSystemLegacy.cacheDirec
  * ⚠️ 只能放**可重建的缓存**：`jfm_items_v1` 是焦焦FM 抓下来的条目，下次打开会重新抓；
  * `jfm_sources_v1` 是用户自己加的收听源（配置，删了就没了）——绝对不能放进来。
  */
-const PRUNABLE_KEYS = ['jfm_items_v1', 'twospace::space-state'];
+const PRUNABLE_KEYS = ['twospace::space-state'];
 
 type Envelope = { v: string; at: number };
 

@@ -26,6 +26,7 @@ import {
   type FmSource,
 } from '../core/jiaojiaoFm';
 import { Btn, Card, useToast } from '../ui/components';
+import { readCmsCache, writeCmsCache } from '../ui/cmsCache';
 import { useApp } from '../store';
 import { cleanEpisodeTitle, mergeProgress } from '../core/jiaojiaoFm';
 import { night, nightFont } from '../ui/nightTheme';
@@ -43,6 +44,16 @@ import { Ico } from '../ui/icons';
 const SRC_KEY = 'jfm_sources_v1';
 /** 上次拉到的条目也缓存下来：退出再进来先看到上次的合集，不用干等网络 */
 const ITEMS_KEY = 'jfm_items_v1';
+/**
+ * FM_ITEMS_FILE_CACHE：条目同时写一份**文件缓存**（ui/cmsCache，永久、不设上限）。
+ *
+ * AsyncStorage 在有些机器上会写满（SQLITE_FULL），一写不进就等于没缓存，
+ * 于是每次进页面都得重新下 4MB 的 RSS、解析十几秒 —— 用户反馈"每次都拉半天"。
+ * 文件缓存和片库/直播同一套，写完立刻能读回来。
+ */
+const FM_ITEMS_CACHE_KEY = 'fm:items';
+
+type FmItemsCache = { items: FmItem[]; at: number; sourceKey: string };
 
 /** 这一层在音频焦点登记表里的名字 */
 const FM_OWNER = 'jiaojiao-fm';
@@ -57,6 +68,15 @@ const FM_OWNER = 'jiaojiao-fm';
  */
 function FmCard({ children }: { children: React.ReactNode }) {
   return <View style={styles.darkCard}>{children}</View>;
+}
+
+/** 「…上 / …中 / …下」的排序权重：同一时间戳时也要保证 上→中→下 */
+function partWeight(title: string): number {
+  const s = String(title ?? '');
+  if (/[（(]?\s*[上]\)?\s*$/.test(s)) return 1;
+  if (/[（(]?\s*[中]\)?\s*$/.test(s)) return 2;
+  if (/[（(]?\s*[下]\)?\s*$/.test(s)) return 3;
+  return 0;
 }
 
 export default function JiaojiaoFmScreen() {
@@ -134,15 +154,29 @@ export default function JiaojiaoFmScreen() {
   useEffect(() => {
     if (autoLoadRef.current) return;
     autoLoadRef.current = true;
-    void AsyncStorage.getItem(ITEMS_KEY)
-      .then((raw) => {
-        if (!raw) return;
-        const cached = JSON.parse(raw) as FmItem[];
+    void readCmsCache<FmItemsCache>(FM_ITEMS_CACHE_KEY)
+      .then((box) => {
+        const cached = box?.value?.items;
         if (Array.isArray(cached) && cached.length > 0) {
           setItems((prev) => (prev.length > 0 ? prev : cached));
+          return true;
         }
+        return false;
       })
-      .catch(() => undefined)
+      .catch(() => false)
+      .then((hit) => {
+        if (hit) return;
+        /* 文件缓存没有 → 退回老的 AsyncStorage 缓存（兼容老版本存下来的） */
+        return AsyncStorage.getItem(ITEMS_KEY)
+          .then((raw) => {
+            if (!raw) return;
+            const cached = JSON.parse(raw) as FmItem[];
+            if (Array.isArray(cached) && cached.length > 0) {
+              setItems((prev) => (prev.length > 0 ? prev : cached));
+            }
+          })
+          .catch(() => undefined);
+      })
       .finally(() => {
         // 源读回来之后，后台静默刷新一次（读不到源就什么都不做）
         void AsyncStorage.getItem(SRC_KEY)
@@ -155,6 +189,8 @@ export default function JiaojiaoFmScreen() {
       });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  /*
 
   /**
    * 删除收听源：服务端共享的那份也删，**本机缓存和已加载条目一起清掉**。
@@ -245,8 +281,20 @@ export default function JiaojiaoFmScreen() {
      * 之前是「一个接一个 await」，某个源卡住（不返回也不报错）整页就永远转圈——
      * 用户看到的就是「一直正在把声音拉进来」。现在最多等 8 秒。
      */
+    /* 先攒着：哪个源先回来就先渲染哪个（以前要等最慢那个，页面一直转圈） */
+    const liveItems: FmItem[] = [];
+    const liveReports: FmHealthReport[] = [];
+    const pushLive = () => {
+      const seenLive = new Set<string>();
+      const dedupLive = liveItems.filter((i) => (seenLive.has(i.key) ? false : (seenLive.add(i.key), true)));
+      dedupLive.sort((a, b) => b.publishedAt - a.publishedAt);
+      setItems(dedupLive);
+      setReports([...liveReports]);
+    };
     const results = await Promise.all(
-      use.map(async (s) => {
+      use.map((s) =>
+        Promise.race([
+          (async () => {
         const t0 = Date.now();
         const ctrl = new AbortController();
         const timer = setTimeout(() => ctrl.abort(), 8000);
@@ -288,7 +336,32 @@ export default function JiaojiaoFmScreen() {
         } finally {
           clearTimeout(timer);
         }
-      }),
+          })(),
+          /* 兜底：无论底层卡在哪一步，9 秒后都给出结果，页面不会一直转圈 */
+          new Promise<{ parsed: FmItem[]; report: FmHealthReport }>((resolve) =>
+            setTimeout(
+              () =>
+                resolve({
+                  parsed: [],
+                  report: {
+                    url: s.url,
+                    status: 'fail',
+                    ms: 9000,
+                    count: 0,
+                    error: '超时（9 秒没返回）',
+                    checkedAt: Date.now(),
+                  } as FmHealthReport,
+                }),
+              9000,
+            ),
+          ),
+        ]).then((r) => {
+          liveItems.push(...r.parsed);
+          liveReports.push(r.report);
+          pushLive();
+          return r;
+        }),
+      ),
     );
     const collected: FmItem[] = [];
     const nextReports: FmHealthReport[] = [];
@@ -299,13 +372,47 @@ export default function JiaojiaoFmScreen() {
     // 去重（同一段音频在多个源里出现只留一条）
     const seen = new Set<string>();
     const dedup = collected.filter((i) => (seen.has(i.key) ? false : (seen.add(i.key), true)));
-    dedup.sort((a, b) => b.publishedAt - a.publishedAt);
+    /*
+     * EP_ORDER_ASC：集内按"播出时间正序"排。
+     * 用户反馈「7 是下、5 才是上，上应该在上面」—— 以前是**倒序**（新的在前），
+     * 于是「…下」排到「…上」前面。听书/连载要的是第 1 集在上，所以改成正序。
+     */
+    dedup.sort((a, b) => {
+      const at = a.publishedAt || 0;
+      const bt = b.publishedAt || 0;
+      if (at !== bt) return at - bt;
+      return partWeight(a.title) - partWeight(b.title);
+    });
     setItems(dedup);
     // 存一份到本机：下次进页面先显示这个（不会因为网络慢就变成"还没有声音"）
+    const cacheBox: FmItemsCache = {
+      items: dedup.slice(0, 1200),
+      at: Date.now(),
+      sourceKey: use.map((s) => s.url).join('|'),
+    };
+    void writeCmsCache(FM_ITEMS_CACHE_KEY, cacheBox);
     void AsyncStorage.setItem(ITEMS_KEY, JSON.stringify(dedup.slice(0, 600))).catch(() => undefined);
     setReports(nextReports);
     setLoading(false);
-    if (!dedup.length) toast.show('没拉到内容，检查一下源地址', 'warn');
+    if (!dedup.length) {
+      toast.show('没拉到内容，检查一下源地址', 'warn');
+    } else {
+      /*
+       * 有源没抓到东西时明确说一句（用户反馈"两个源只显示一个合集"），
+       * 并把是哪个源、什么原因写进那一行的状态里，不再静默少一个合集。
+       */
+      const broken = nextReports.filter((r) => r.status === 'fail');
+      if (broken.length > 0) {
+        const names = broken
+          .map((r) => use.find((s) => s.url === r.url)?.name ?? r.url)
+          .slice(0, 2)
+          .join('、');
+        toast.show(
+          `${broken.length} 个源没抓到内容：${names}${broken.length > 2 ? ' 等' : ''}（点该行看原因）`,
+          'warn',
+        );
+      }
+    }
   };
 
   /*
@@ -326,12 +433,9 @@ export default function JiaojiaoFmScreen() {
       releaseAudioFocus(FM_OWNER);
       const p = playerRef.current;
       playerRef.current = null;
-      try {
-        p?.pause();
-        (p as unknown as { remove?: () => void })?.remove?.();
-      } catch {
-        /* 忽略 */
-      }
+      killPlayer(p);
+      for (const extra of playersRef.current) killPlayer(extra);
+      playersRef.current = [];
     };
   }, []);
 
@@ -400,14 +504,11 @@ export default function JiaojiaoFmScreen() {
     }
     try {
       claimAudioFocus(FM_OWNER);
-      const oldP = playerRef.current;
+      killPlayer(playerRef.current);
+      playerRef.current = null;
       const np = createAudioPlayer({ uri: target.audio });
       playerRef.current = np;
-      try {
-        (oldP as unknown as { remove?: () => void })?.remove?.();
-      } catch {
-        /* 忽略 */
-      }
+      rememberAndKillOthers(np);
       void np.seekTo(Math.max(0, remote.positionSec));
       if (remote.playing) np.play();
       setPlaying(target);
@@ -419,6 +520,41 @@ export default function JiaojiaoFmScreen() {
     }
   };
 
+  /**
+   * 彻底停掉一个播放器（换集 / 交接 / 卸载都要用）。
+   *
+   * FM_KILL_PLAYER：以前换集只 「remove()」、不 「pause()」。只要 remove 抛异常或没来得及生效，
+   * 旧的那一路会继续出声 —— 表现就是"点第 1 集再点第 2 集，两集一起放"。
+   * 这里先 pause、再把音量归零、最后 remove，任何一步失败都不影响下一步。
+   */
+  const killPlayer = (p: AudioPlayer | null | undefined) => {
+    if (!p) return;
+    try {
+      p.pause();
+    } catch {
+      /* 忽略 */
+    }
+    try {
+      p.volume = 0;
+    } catch {
+      /* 忽略 */
+    }
+    try {
+      (p as unknown as { remove?: () => void }).remove?.();
+    } catch {
+      /* 忽略 */
+    }
+  };
+
+  /** 所有创建过的播放器：换集时统一扫一遍，杜绝"漏杀"导致多路叠音 */
+  const playersRef = useRef<AudioPlayer[]>([]);
+  const rememberAndKillOthers = (next: AudioPlayer) => {
+    for (const old of playersRef.current) {
+      if (old !== next) killPlayer(old);
+    }
+    playersRef.current = [next];
+  };
+
   const play = (item: FmItem) => {
     try {
       /*
@@ -428,14 +564,13 @@ export default function JiaojiaoFmScreen() {
        *    一直留在内存里，来回换几次就变成多路声音 / Cannot create AudioTrack。
        */
       claimAudioFocus(FM_OWNER);
-      const prev = playerRef.current;
-      playerRef.current = createAudioPlayer({ uri: item.audio });
-      try {
-        (prev as unknown as { remove?: () => void })?.remove?.();
-      } catch {
-        /* 老版本没有 remove */
-      }
-      playerRef.current.play();
+      /* 先彻底停掉上一集，再建新的（顺序反过来的话，remove 慢一拍就变成两路同时响） */
+      killPlayer(playerRef.current);
+      playerRef.current = null;
+      const next = createAudioPlayer({ uri: item.audio });
+      playerRef.current = next;
+      rememberAndKillOthers(next);
+      next.play();
       setPlaying(item);
       setIsPlaying(true);
       // 记住"上次听的是 FM"：首页只在这次是 FM 时才自动续播
@@ -499,6 +634,13 @@ export default function JiaojiaoFmScreen() {
       fmProgress?: { itemKey: string; positionSec: number; playing: boolean; role: 'A' | 'B'; updatedAt: number } | null;
     }).fmProgress;
     if (!remote || !remote.itemKey) return;
+    /*
+     * FOLLOW_ONLY_PARTNER（真实 bug：「点进来他自己会播放，按钮却还显示播放」）：
+     * 这里以前不看 remote.role —— 我自己上次的进度也会被当成"要跟随"，
+     * 于是刚进页面就自动开播；而 isPlaying 取的是 remote.playing（我是暂停），
+     * 结果声音在放、按钮却显示"播放"。
+     */
+    if (remote.role === role) return;
     if (remote.updatedAt <= syncRef.current) return;
     const p = playerRef.current;
     // 对方换集了：开了自动跟随便切过去，否则保持现状
@@ -512,16 +654,14 @@ export default function JiaojiaoFmScreen() {
       }
       try {
         claimAudioFocus(FM_OWNER);
-        const oldP = playerRef.current;
+        killPlayer(playerRef.current);
+        playerRef.current = null;
         const np = createAudioPlayer({ uri: target.audio });
         playerRef.current = np;
-        try {
-          (oldP as unknown as { remove?: () => void })?.remove?.();
-        } catch {
-          /* 忽略 */
-        }
-        np.play();
+        rememberAndKillOthers(np);
         void np.seekTo(Math.max(0, remote.positionSec));
+        /* 对方在放就跟着放；对方暂停就跟过去但不出声（状态和声音必须一致） */
+        if (remote.playing) np.play();
         setPlaying(target);
         setIsPlaying(remote.playing);
         return;
@@ -565,6 +705,25 @@ export default function JiaojiaoFmScreen() {
   const allSources = sharedSources && sharedSources.length ? sharedSources : sources;
 
   const visibleItems = allSources.length === 0 ? [] : items;
+  /*
+   * SOURCE_WATCH：源列表一变就自动重新拉一遍。
+   *
+   * 真实 bug：加了第二个源（或对方加的源从服务端同步过来）之后，
+   * 只有"进页面那一次" refresh 覆盖到的源有数据，新源既不抓条目也没有健康状态
+   * → 界面上「2 个源却只显示 1 个合集」，另一个显示「未检测」。
+   */
+  const sourceKey = allSources
+    .filter((s) => s.enabled)
+    .map((s) => s.url)
+    .join('|');
+  const lastSourceKeyRef = useRef('');
+  useEffect(() => {
+    if (!sourceKey) return;
+    if (sourceKey === lastSourceKeyRef.current) return;
+    lastSourceKeyRef.current = sourceKey;
+    void refresh();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sourceKey]);
   useEffect(() => {
     if (allSources.length === 0 && items.length > 0) {
       setItems([]);
@@ -586,8 +745,18 @@ export default function JiaojiaoFmScreen() {
         map.set(name, { name, cover: it.cover, items: [it], latest: it.publishedAt });
       }
     }
+    for (const g of map.values()) {
+      g.items.sort((a, b) => (a.publishedAt || 0) - (b.publishedAt || 0));
+    }
     return [...map.values()].sort((a, b) => b.latest - a.latest);
   }, [visibleItems]);
+
+  /** 当前打开的合集里的条目（按播出时间正序；没有打开就是空） */
+  const albumEps = React.useMemo(() => {
+    if (!openAlbum) return [] as FmItem[];
+    const hit = albumGroups.find((g) => g.name === openAlbum);
+    return hit ? hit.items : [];
+  }, [openAlbum, albumGroups]);
 
   /** 分组之后再按搜索词过滤 */
   const shownGroups = useMemo(() => {
@@ -763,7 +932,7 @@ export default function JiaojiaoFmScreen() {
         <View style={{ height: 14 }} />
 
         {/* 条目 */}
-        {loading ? (
+        {loading && list.length === 0 ? (
           <View style={{ paddingVertical: 30, alignItems: 'center' }}>
             <ActivityIndicator color={night.cyan as unknown as string} />
             <Text style={styles.hint}>正在把声音拉进来…</Text>
@@ -782,14 +951,14 @@ export default function JiaojiaoFmScreen() {
                 <Text style={styles.backRowText}>‹ 返回全部合集</Text>
               </Pressable>
               <Text style={styles.groupTitle}>
-                {openAlbum} · {list.length} 集
+                {openAlbum} · {albumEps.length} 集
               </Text>
               {/* 选集列表：一行一集，显示标题 + 时长；每页 20 条可翻页 */}
               {(() => {
-                const pageCount = Math.max(1, Math.ceil(list.length / EP_PAGE_SIZE));
+                const pageCount = Math.max(1, Math.ceil(albumEps.length / EP_PAGE_SIZE));
                 const page = Math.min(epPage, pageCount - 1);
                 const from = page * EP_PAGE_SIZE;
-                const slice = list.slice(from, from + EP_PAGE_SIZE);
+                const slice = albumEps.slice(from, from + EP_PAGE_SIZE);
                 return (
                   <>
                     <View style={styles.epList}>
@@ -832,7 +1001,7 @@ export default function JiaojiaoFmScreen() {
                           <Text style={styles.pagerBtnText}>‹ 上一页</Text>
                         </Pressable>
                         <Text style={styles.pagerText}>
-                          第 {page + 1}/{pageCount} 页 · 共 {list.length} 集
+                          第 {page + 1}/{pageCount} 页 · 共 {albumEps.length} 集
                         </Text>
                         <Pressable
                           onPress={() => setEpPage(Math.min(pageCount - 1, page + 1))}

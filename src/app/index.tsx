@@ -1,6 +1,6 @@
 import { usePathname, useRouter } from 'expo-router';
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { Animated, Easing, Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
+import { ActivityIndicator, Animated, Easing, Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
 
 import { useApp } from '../store';
 import { ambienceFor, dailyQuote } from '../core/ambience';
@@ -209,8 +209,29 @@ export default function TodayScreen() {
     partnerRoute && pathname && pathname.startsWith(String(partnerRoute).split('?')[0]),
   );
 
+  /*
+   * 还没拿到服务端快照：只可能是"刚启动/刚回到前台还没连上"，
+   * 这时 boundAt 一定是默认的 null，不能据此说"没有双人空间"。
+   */
+  if (snapshot.boundAt === null && !store.serverSnapshotReady) {
+    return (
+      <View style={[styles.root, { backgroundColor: pageBg(color.bg) }]}>
+        <Flair theme="today" />
+        <Aurora mode="light" accent="#E9A24B" intensity={0.8} />
+        <Screen title="今天" subtitle="正在连接你们的空间…" right={<DevicePills />}>
+          <View style={{ paddingVertical: 60, alignItems: 'center' }}>
+            <ActivityIndicator color={color.primary} />
+            <Text style={[font.small, { marginTop: 12, color: color.inkMid }]}>
+              正在读取你们两个人的空间，稍等一下
+            </Text>
+          </View>
+        </Screen>
+      </View>
+    );
+  }
+
   // 未绑定时不能渲染双人主页（解绑后 boundAt 会被置空）
-  if (snapshot.boundAt === null) {
+  if (snapshot.boundAt === null && store.serverSnapshotReady) {
     return (
       <View style={[styles.root, { backgroundColor: pageBg(color.bg) }]}>
       <Flair theme="today" />
