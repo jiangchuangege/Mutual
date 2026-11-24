@@ -1,4 +1,4 @@
-import { useRouter } from 'expo-router';
+import { usePathname, useRouter } from 'expo-router';
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Animated, Easing, Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
 
@@ -202,6 +202,13 @@ export default function TodayScreen() {
     presenceNow,
   );
 
+  /* C2：已经在 TA 所在的那个页面里，就不再提示「过去」 */
+  const pathname = usePathname();
+  const partnerRoute = partnerPresence.route;
+  const alreadyHere = Boolean(
+    partnerRoute && pathname && pathname.startsWith(String(partnerRoute).split('?')[0]),
+  );
+
   // 未绑定时不能渲染双人主页（解绑后 boundAt 会被置空）
   if (snapshot.boundAt === null) {
     return (
@@ -294,7 +301,7 @@ export default function TodayScreen() {
             <Text style={[font.tiny, { flex: 1, lineHeight: 17 }]}>{amb.greeting}</Text>
           </View>
           {/* TA 正在某个模块里：一条可点的提示，点一下直接过去一起看/一起听 */}
-          {partnerPresence.hint && partnerPresence.route ? (
+          {partnerPresence.hint && partnerPresence.route && !alreadyHere ? (
             <Pressable
               onPress={() => router.push(partnerPresence.route as never)}
               style={[styles.joinHint, { borderColor: color.primary }]}

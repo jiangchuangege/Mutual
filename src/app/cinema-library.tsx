@@ -1,3 +1,4 @@
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useRouter } from 'expo-router';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { isFresh, readCmsCache, writeCmsCache } from '../ui/cmsCache';
@@ -90,6 +91,48 @@ export default function CinemaLibraryScreen() {
   const [yearFilter, setYearFilter] = useState<string | null>(null);
   const [monthFilter, setMonthFilter] = useState<string | null>(null);
   const [keyword, setKeyword] = useState('');
+  /* D2：搜索历史（本机保存，最多 10 条） */
+  const [history, setHistory] = useState<string[]>([]);
+  const HISTORY_KEY = 'cms_search_history_v1';
+  useEffect(() => {
+    void AsyncStorage.getItem(HISTORY_KEY)
+      .then((raw) => {
+        const list = raw ? (JSON.parse(raw) as string[]) : [];
+        if (Array.isArray(list)) setHistory(list.slice(0, 10));
+      })
+      .catch(() => undefined);
+  }, []);
+  const pushHistory = (kw: string) => {
+    const k = kw.trim();
+    if (!k) return;
+    setHistory((prev) => {
+      const next = [k, ...prev.filter((x) => x !== k)].slice(0, 10);
+      void AsyncStorage.setItem(HISTORY_KEY, JSON.stringify(next)).catch(() => undefined);
+      return next;
+    });
+  };
+  /* D3：相近片名（从已加载列表里找，命中 2 字以上或前后包含） */
+  const similarTitles = (kw: string): string[] => {
+    const k = kw.trim();
+    if (k.length < 2) return [];
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const it of items) {
+      const name = String(it.name ?? '');
+      if (!name || seen.has(name) || name === k) continue;
+      const hit =
+        name.includes(k) ||
+        k.includes(name) ||
+        (k.length >= 2 && name.includes(k.slice(0, 2))) ||
+        (k.length >= 2 && name.includes(k.slice(-2)));
+      if (hit) {
+        seen.add(name);
+        out.push(name);
+        if (out.length >= 6) break;
+      }
+    }
+    return out;
+  };
   const [searching, setSearching] = useState(false);
   const [searchMode, setSearchMode] = useState(false);
   const [page, setPage] = useState(1);
@@ -580,6 +623,7 @@ export default function CinemaLibraryScreen() {
   };
 
   const runSearch = () => {
+    pushHistory(keyword);
     const text = keyword.trim();
     if (!text) {
       setSearchMode(false);
@@ -786,6 +830,52 @@ export default function CinemaLibraryScreen() {
           </Pressable>
         ) : null}
       </View>
+
+
+      {/* SEARCH_HISTORY_UI（D2 历史 / D3 相近片名） */}
+      {!searchMode && history.length > 0 ? (
+        <View style={stylesExtra.histRow}>
+          <Text style={[nightFont.tiny, { marginRight: 6 }]}>最近搜过</Text>
+          {history.slice(0, 5).map((h) => (
+            <Pressable
+              key={`hist-${h}`}
+              onPress={() => {
+                setKeyword(h);
+                setTimeout(() => runSearch(), 60);
+              }}
+              style={stylesExtra.histChip}
+            >
+              <Text style={{ color: night.text, fontSize: 11 }}>{h}</Text>
+            </Pressable>
+          ))}
+          <Pressable
+            onPress={() => {
+              setHistory([]);
+              void AsyncStorage.removeItem(HISTORY_KEY).catch(() => undefined);
+            }}
+          >
+            <Text style={{ color: night.textDim, fontSize: 11 }}>清空</Text>
+          </Pressable>
+        </View>
+      ) : null}
+
+      {searchMode && similarTitles(keyword).length > 0 ? (
+        <View style={stylesExtra.histRow}>
+          <Text style={[nightFont.tiny, { marginRight: 6 }]}>相近片名</Text>
+          {similarTitles(keyword).map((t) => (
+            <Pressable
+              key={`sim-${t}`}
+              onPress={() => {
+                setKeyword(t);
+                setTimeout(() => runSearch(), 60);
+              }}
+              style={stylesExtra.histChip}
+            >
+              <Text style={{ color: night.cyan, fontSize: 11 }}>{t}</Text>
+            </Pressable>
+          ))}
+        </View>
+      ) : null}
 
       {loading ? (
         <View style={styles.centerBox}>
@@ -1106,6 +1196,11 @@ export default function CinemaLibraryScreen() {
     </View>
   );
 }
+
+const stylesExtra = StyleSheet.create({
+  histRow: { flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', gap: 6, paddingHorizontal: 14, paddingBottom: 8 },
+  histChip: { paddingHorizontal: 10, paddingVertical: 5, borderRadius: 999, backgroundColor: night.glassHi, borderWidth: 1, borderColor: night.line },
+});
 
 const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: 'transparent' },

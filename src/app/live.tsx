@@ -194,7 +194,7 @@ export default function LiveScreen() {
         </View>
       ) : entries.length === 0 ? (
         /* 空状态：没有源 */
-        <ScrollView contentContainerStyle={{ padding: 20, paddingBottom: 60 }}>
+        <ScrollView contentContainerStyle={{ padding: 20, paddingBottom: insets.bottom + 130 }}>
           <View style={{ alignItems: 'center', marginTop: 20 }}>
             <WallpaperBadge size={124} caption="内置壁纸：伊蕾娜 · 夜幕" />
           </View>
@@ -248,14 +248,14 @@ export default function LiveScreen() {
             ) : null}
           </View>
 
-          {/* 源筛选：点进分组后不显示（避免压住频道标题） */}
+          {/* 源筛选：自带一层底色 + zIndex，避免文字被上方卡片压住 */}
           {openGroup ? null : (
           <>
           <ScrollView
             horizontal
             showsHorizontalScrollIndicator={false}
             style={{ flexGrow: 0, maxHeight: 46 }}
-            contentContainerStyle={{ paddingHorizontal: 14, gap: 8, paddingBottom: 8 }}
+            contentContainerStyle={{ paddingHorizontal: 14, gap: 8, paddingBottom: insets.bottom + 130 }}
           >
             <Pressable onPress={() => setSourceFilter(null)}>
               <NightPill label={`全部台`} active={sourceFilter === null} tone="cyan" />
@@ -303,7 +303,9 @@ export default function LiveScreen() {
               <Ico name="live" size="xl" color="#57F8FF" />
               <View style={{ flex: 1, marginLeft: 12 }}>
                 <Text style={styles.sourceName} numberOfLines={1}>
-                  {store.liveSourceUrls?.[0]?.replace(/^https?:\/\//, '').split('/')[0] ?? '我的直播源'}
+                  {entries[0]?.name ||
+                (store.liveSourceUrls?.[0] ?? '').replace(/^https?:\/\//, '').split('/')[0] ||
+                '我的直播源'}
                 </Text>
                 <Text style={styles.sourceMeta} numberOfLines={1}>
                   {groups.length} 个分组 · {groups.reduce((n, g) => n + g.channels.length, 0)} 个台 · 点开观看
@@ -438,6 +440,13 @@ function ChannelCard({
 }
 
 const styles = StyleSheet.create({
+  chipLayer: {
+    backgroundColor: 'rgba(8,10,20,0.55)',
+    borderTopWidth: 1,
+    borderBottomWidth: 1,
+    borderColor: 'rgba(255,255,255,0.08)',
+    zIndex: 3,
+  },
   root: { flex: 1, backgroundColor: night.bgDeep },
   header: {
     flexDirection: 'row',

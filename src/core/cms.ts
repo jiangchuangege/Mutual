@@ -560,21 +560,25 @@ export async function searchVodDeep(
   if (!kw) return { list: [], mode: 'none' };
 
   // 1) 接口自己的搜索（拿回来仍然按片名过滤，绝不让不相关的片混进来）
-  const direct = await fetchCmsSearchPage(apiUrl, kw, 1);
+  /* 单源 6 秒上限：慢源直接算"没命中"，不拖累整次搜索 */
+  const direct = await Promise.race([
+    fetchCmsSearchPage(apiUrl, kw, 1),
+    new Promise<{ ok: false; error: string }>((r) => setTimeout(() => r({ ok: false, error: '超时' }), 6000)),
+  ]);
   if (direct.ok) {
     const filtered = filterByTitle(direct.page.list, kw);
     if (filtered.length > 0) return { list: filtered, mode: 'server' };
   }
 
-  // 2) 兜底：只在自己已经拿到的列表 + 前两页里按片名过滤
-  const pool: CmsVod[] = [...knownList];
-  for (let p = 1; p <= maxPages; p += 1) {
-    const r = await fetchCmsPage(apiUrl, p);
-    if (!r.ok) break;
-    pool.push(...r.page.list);
-    if (filterByTitle(pool, kw).length >= 30) break;
-  }
-  const local = filterByTitle(pool, kw);
+  /*
+   * 2) 兜底：**只在已经拿到手里的列表里**按片名过滤，不再去翻第 1、2 页。
+   *
+   * 这是"搜索像在扫全库"的元凶：接口搜索没命中时，原来会去拉该接口的前两页，
+   * 17 个接口 × 2 页 = 34 个请求、每个还有 12 秒超时，一个慢源就把整页拖住。
+   * 现在只用调用方内存里已有的列表；搜不到立即返回空，由界面提示换关键词。
+   */
+  const local = filterByTitle(knownList, kw);
+  void maxPages;
   return { list: local, mode: local.length > 0 ? 'local' : 'none' };
 }
 
@@ -585,8 +589,11 @@ export async function searchAcrossApis(
   knownList: CmsVod[] = [],
 ): Promise<{ list: CmsVod[]; modes: Array<{ label: string; mode: 'server' | 'local' | 'none' }> }> {
   const urls = apiUrls.filter((u) => u && /^https?:\/\//i.test(u.trim()));
+  /* 先搜前 8 个源把结果给用户（多源并行、每个 6 秒上限），不再等全部 17 个 */
+  const fastUrls = urls.slice(0, 8);
+  void urls;
   const results = await Promise.all(
-    urls.map(async (api) => {
+    fastUrls.map(async (api) => {
       const label = apiLabel(api);
       try {
         const r = await searchVodDeep(api, keyword, 2, knownList);

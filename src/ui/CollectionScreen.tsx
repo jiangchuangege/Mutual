@@ -5,6 +5,7 @@ import * as ImagePicker from 'expo-image-picker';
 import { useAudioPlayer } from 'expo-audio';
 import { Image, Pressable, StyleSheet, Text, View } from 'react-native';
 
+import PhotoViewer from './PhotoViewer';
 import { COLLECTION_SPECS } from '../core/modules';
 import type { CollectionItem, CollectionKind } from '../core/types';
 import { useApp } from '../store';
@@ -41,6 +42,13 @@ export function CollectionScreen({
   onListen: () => void;
 }) {
   const { store, snapshot, role } = useApp();
+
+  /** A1：全屏看图（照片回忆） */
+  const [photoViewer, setPhotoViewer] = useState<{ uris: string[]; index: number } | null>(null);
+  const onOpenPhoto = (uris: string[], index: number) => {
+    if (uris.length === 0) return;
+    setPhotoViewer({ uris, index: Math.max(0, Math.min(index, uris.length - 1)) });
+  };
   const confirm = useConfirm();
   const spec = COLLECTION_SPECS[kind];
   const partner: 'A' | 'B' = role === 'A' ? 'B' : 'A';
@@ -314,16 +322,28 @@ export function CollectionScreen({
 
         {kind === 'photoMemory' && ['photo1', 'photo2', 'photo3'].some((k) => item.meta[k]) ? (
           <View style={styles.photoRow}>
-            {['photo1', 'photo2', 'photo3']
+            {(['photo1', 'photo2', 'photo3'] as const)
               .filter((k) => item.meta[k])
-              .map((k) => (
-                <CollectionImage
+              .map((k, i) => (
+                <Pressable
                   key={k}
-                  uri={item.meta[k]}
-                  label={item.title}
-                  style={styles.photoThumb}
-                  square
-                />
+                  /* A1：点一下就看大图 */
+                  onPress={() =>
+                    onOpenPhoto(
+                      (['photo1', 'photo2', 'photo3'] as const)
+                        .map((x) => item.meta[x])
+                        .filter(Boolean) as string[],
+                      i,
+                    )
+                  }
+                >
+                  <CollectionImage
+                    uri={item.meta[k]}
+                    label={item.title}
+                    style={styles.photoThumb}
+                    square
+                  />
+                </Pressable>
               ))}
           </View>
         ) : null}
@@ -460,6 +480,15 @@ export function CollectionScreen({
 
         <View style={{ height: 60 }} />
       </Screen>
+      {/* A1：全屏看图 */}
+      {photoViewer ? (
+        <PhotoViewer
+          uris={photoViewer.uris}
+          index={photoViewer.index}
+          onIndex={(i2) => setPhotoViewer((v) => (v ? { ...v, index: i2 } : v))}
+          onClose={() => setPhotoViewer(null)}
+        />
+      ) : null}
 
       <Sheet visible={addOpen} title={spec.empty.action} onClose={() => setAddOpen(false)}>
         <Field label={spec.titleLabel} value={title} onChangeText={setTitle} placeholder={spec.titleLabel} />
@@ -635,6 +664,8 @@ function CollectionImage({
   square?: boolean;
   /** 加载失败时的补救入口（重新传一张） */
   onFix?: () => void;
+  /** A1：点照片打开全屏查看 */
+  onOpenPhoto?: (uris: string[], index: number) => void;
 }) {
   const { store } = useApp();
   const [failed, setFailed] = useState(false);

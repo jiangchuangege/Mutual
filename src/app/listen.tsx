@@ -1,6 +1,6 @@
 import { useRouter } from 'expo-router';
 import * as DocumentPicker from 'expo-document-picker';
-import React, { useState, useEffect } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -26,10 +26,29 @@ export default function ListenScreen() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
   const { store, snapshot, role } = useApp();
+  const partner: 'A' | 'B' = role === 'A' ? 'B' : 'A';
   const music = snapshot.music;
   const voiceConnected = snapshot.voice.status === 'connected';
   // 播放引擎在 AppFrame 里挂载（全 App 唯一），这里直接用
   const engine = useGlobalMusicEngine();
+
+  /*
+   * JOIN_ROOM_ALIGN（C1）：从首页点「过去」进来 = 加入 TA 的房间。
+   * 进页面就对齐一次：把本地进度跳到「对方位置 + 已过时间」。
+   * 只在播放中、且最后操作者是 TA 时才对齐，避免把我自己的操作顶掉。
+   */
+  const alignDone = useRef(false);
+  useEffect(() => {
+    if (alignDone.current) return;
+    alignDone.current = true;
+    const m = snapshot.music;
+    if (!m || m.action !== 'play') return;
+    if (m.updatedBy === role) return;
+    const elapsed = Math.max(0, (Date.now() - (m.updatedAtServerMs || Date.now())) / 1000);
+    const target = Math.max(0, (m.positionSec || 0) + elapsed);
+    if (target > 1) store.musicAction('seek', { positionSec: target });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // 记录"上次听的是音乐"：首页据此决定要不要自动续播 FM
   useEffect(() => {
@@ -62,7 +81,17 @@ export default function ListenScreen() {
         />
 
         <View style={{ flexDirection: 'row', gap: 10 }}>
-          <Btn
+            <Text style={[font.tiny, { marginBottom: 6, color: color.inkSoft }]}>
+                {(() => {
+                  const pp = (snapshot as unknown as {
+                    presence?: Partial<Record<'A' | 'B', { surface: string; at: number }>>;
+                  }).presence?.[(role === 'A' ? 'B' : 'A')];
+                  return pp?.surface === 'listen'
+                    ? '房间已连接：TA 也在听 · 点下面按钮可把两边对齐'
+                    : 'TA 暂时不在这个房间，TA 进来后会自动跟随';
+                })()}
+              </Text>
+<Btn
             title="↻ 同步到这里"
             small
             variant="soft"
