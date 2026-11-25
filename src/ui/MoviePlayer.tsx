@@ -636,41 +636,51 @@ function MoviePlayerInner({
 
   /** 控制条：竖屏和全屏共用 */
   const renderControls = (full: boolean) => (
-    <View style={[styles.controls, full ? styles.controlsFull : null]}>
-      <Pressable onPress={() => { bumpUi(); toggle(); }} style={styles.playBtn}>
-        <Text style={{ color: '#FFFFFF', fontSize: full ? 18 : 15 }}>{playing ? '⏸' : '▶'}</Text>
-      </Pressable>
-      <Pressable onPress={() => { bumpUi(); seekBy(-10); }} style={styles.smallBtn}>
-        <Text style={styles.smallBtnText}>−10s</Text>
-      </Pressable>
-      <SeekBar
-        position={position}
-        duration={duration}
-        onPreview={setScrubTarget}
-        onCommit={applySeek}
-      />
-      <Text style={styles.time}>
-        {formatDuration(position)} / {formatDuration(duration)}
-      </Text>
-      <Pressable onPress={() => { bumpUi(); seekBy(10); }} style={styles.smallBtn}>
-        <Text style={styles.smallBtnText}>+10s</Text>
-      </Pressable>
-      {sync ? (
-        <Pressable onPress={() => { bumpUi(); syncNow(); }} style={styles.smallBtn}>
-          <Text style={styles.smallBtnText}>同步进度</Text>
+    <View style={styles.controlsWrap}>
+      {/* 第一行：播放 + ±10s + 进度条 + 时间（永远不能被截断） */}
+      <View style={[styles.controls, full ? styles.controlsFull : null]}>
+        <Pressable onPress={() => { bumpUi(); toggle(); }} style={styles.playBtn}>
+          <Text style={{ color: '#FFFFFF', fontSize: full ? 18 : 15 }}>{playing ? '⏸' : '▶'}</Text>
         </Pressable>
-      ) : null}
-      <Pressable onPress={() => { bumpUi(); setRateSheet((v) => !v); }} style={styles.smallBtn}>
-        <Text style={styles.smallBtnText}>{rate === 1 ? '倍速' : `${rate}x`}</Text>
-      </Pressable>
-      {sourceSwitcher ? (
-        <Pressable onPress={() => { bumpUi(); sourceSwitcher.onPress(); }} style={styles.smallBtn}>
-          <Text style={styles.smallBtnText}>{sourceSwitcher.label}</Text>
+        <Pressable onPress={() => { bumpUi(); seekBy(-10); }} style={styles.smallBtn}>
+          <Text style={styles.smallBtnText}>−10s</Text>
         </Pressable>
-      ) : null}
-      <Pressable onPress={() => { bumpUi(); if (full) void exitFullscreen(); else void enterFullscreen(); }} style={styles.smallBtn}>
-        <Text style={styles.smallBtnText}>{full ? '✕ 退出' : '⛶ 放大'}</Text>
-      </Pressable>
+        <SeekBar
+          position={position}
+          duration={duration}
+          onPreview={setScrubTarget}
+          onCommit={applySeek}
+        />
+        <Text style={styles.time}>
+          {formatDuration(Math.max(0, position))} / {formatDuration(duration)}
+        </Text>
+        <Pressable onPress={() => { bumpUi(); seekBy(10); }} style={styles.smallBtn}>
+          <Text style={styles.smallBtnText}>+10s</Text>
+        </Pressable>
+      </View>
+      {/*
+       * 第二行：同步 / 倍速 / 换源 / 放大。
+       * 以前八颗按钮挤在一行里，窄屏手机上「换源」「放大」直接被切掉了
+       * （用户截图：右边一截没了，看起来像整个 UI 歪了）。现在换行排。
+       */}
+      <View style={styles.controlsRow2}>
+        {sync ? (
+          <Pressable onPress={() => { bumpUi(); syncNow(); }} style={styles.smallBtn}>
+            <Text style={styles.smallBtnText}>同步进度</Text>
+          </Pressable>
+        ) : null}
+        <Pressable onPress={() => { bumpUi(); setRateSheet((v) => !v); }} style={styles.smallBtn}>
+          <Text style={styles.smallBtnText}>{rate === 1 ? '倍速' : `${rate}x`}</Text>
+        </Pressable>
+        {sourceSwitcher ? (
+          <Pressable onPress={() => { bumpUi(); sourceSwitcher.onPress(); }} style={styles.smallBtn}>
+            <Text style={styles.smallBtnText}>{sourceSwitcher.label}</Text>
+          </Pressable>
+        ) : null}
+        <Pressable onPress={() => { bumpUi(); if (full) void exitFullscreen(); else void enterFullscreen(); }} style={styles.smallBtn}>
+          <Text style={styles.smallBtnText}>{full ? '✕ 退出' : '⛶ 放大'}</Text>
+        </Pressable>
+      </View>
     </View>
   );
 
@@ -1123,11 +1133,18 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(0,0,0,0.45)',
   },
   expandHint: { color: '#FFFFFF', fontSize: 14 },
+  controlsWrap: { marginTop: 8 },
   controls: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 6,
-    marginTop: 8,
+  },
+  controlsRow2: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    flexWrap: 'wrap',
+    gap: 6,
+    marginTop: 6,
   },
   controlsFull: {
     paddingHorizontal: 16,

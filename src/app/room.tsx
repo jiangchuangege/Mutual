@@ -581,8 +581,9 @@ export default function RoomScreen() {
             {snapshot.members[partner].online ? 'TA 正在和你一起看' : 'TA 暂时不在线'}
           </Text>
           <Text style={styles.duoSub} numberOfLines={1}>
-            {inPlaybackText(room.state)} · 偏差 {m.drift >= 0 ? '+' : ''}
-            {m.drift.toFixed(2)}s
+            {/* 主控这里不要显示"偏差"：那个数字是本机模拟设备的指标，主控看了只会以为出错
+                （用户截图：主控右上角挂着 -192.45s，吓人）。真正的偏差在播放器里那颗胶囊上 */}
+            {isLeader ? '你在掌着进度' : '跟着 TA 的进度'} · {inPlaybackText(room.state)}
           </Text>
         </View>
       </View>
