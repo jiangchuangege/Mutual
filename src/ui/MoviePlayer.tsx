@@ -1,6 +1,8 @@
 import * as ScreenOrientation from 'expo-screen-orientation';
 import { computeTargetPosition } from '../core/drift';
 import { useVideoPlayer, VideoView } from 'expo-video';
+
+import { claimAudioFocus, releaseAudioFocus } from '../lib/audioFocus';
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
@@ -80,6 +82,15 @@ function MoviePlayerInner({
     onRequestPlayPause?: (playing: boolean) => void;
   };
 }) {
+
+  /*
+   * VIDEO_TAKES_FOCUS：播视频时把其它音源（FM / 一起听 / 试听）全部暂停，
+   * 否则会出现"画面在看、声音在窜"（电视直播那边同样处理）。
+   */
+  React.useEffect(() => {
+    claimAudioFocus('movie-player');
+    return () => releaseAudioFocus('movie-player');
+  }, []);
   /*
    * 片源地址 → 播放器源对象。
    *

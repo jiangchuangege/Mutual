@@ -9,6 +9,7 @@ import * as ScreenOrientation from 'expo-screen-orientation';
 import { checkLiveChannel, type HealthReport } from '../core/sourceHealth';
 import { readCmsCache } from '../ui/cmsCache';
 import { filterLiveCatalog } from '../ui/liveCatalogFilter';
+import { claimAudioFocus, releaseAudioFocus } from '../lib/audioFocus';
 import { useApp } from '../store';
 import { setBackgroundVideoSuppressed } from '../ui/bgVideoGate';
 import { night, nightFont } from '../ui/nightTheme';
@@ -142,6 +143,15 @@ export default function LivePlayerScreen() {
   };
 
   const [urlIndex, setUrlIndex] = useState(0);
+  /*
+   * VIDEO_TAKES_FOCUS（真实 bug：「看电视的时候 FM 声音还在，窜在一起」）：
+   * 视频页面以前**谁也不抢音频焦点**，于是后台的 FM / 一起听照放不误。
+   * 这里进页面（以及换线路/换台）就抢焦点，把其它音源全部暂停；离开页面再让出。
+   */
+  useEffect(() => {
+    claimAudioFocus('live-player');
+    return () => releaseAudioFocus('live-player');
+  }, [primary]);
   const [overlay, setOverlay] = useState(true);
   const [report, setReport] = useState<HealthReport | null>(null);
   const [checking, setChecking] = useState(false);
