@@ -22,6 +22,7 @@ const BUILTIN_BG_POSTER = require('../../assets/bg/bg-poster.jpg');
 import { applySurfaceMode } from './dynamicSurfaces';
 import { surfaceFromPath } from './presence';
 import { ProfileGate } from './ProfileGate';
+import { FmEngineHost } from './FmEngineHost';
 import { MusicEngineHost } from './MusicEngineHost';
 import { CacheWarmer } from './CacheWarmer';
 import { color, setCustomBgActive } from './theme';
@@ -273,7 +274,10 @@ export function AppFrame({ children }: { children: React.ReactNode }) {
           <View pointerEvents="none" style={styles.scrimVideo} />
         </>
       ) : null}
-      <MusicEngineHost>{children}</MusicEngineHost>
+      <MusicEngineHost>
+        {/* FM 的播放器也挂在全局：切页面/退到后台都不停（和音乐引擎同级） */}
+        <FmEngineHost>{children}</FmEngineHost>
+      </MusicEngineHost>
       {/* 后台预热永久缓存（渲染 null）：只补没缓存过的源 */}
       <CacheWarmer />
       <ProfileGate />

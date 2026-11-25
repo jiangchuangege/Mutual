@@ -7,6 +7,8 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import * as ScreenOrientation from 'expo-screen-orientation';
 
 import { checkLiveChannel, type HealthReport } from '../core/sourceHealth';
+import { readCmsCache } from '../ui/cmsCache';
+import { filterLiveCatalog } from '../ui/liveCatalogFilter';
 import { useApp } from '../store';
 import { setBackgroundVideoSuppressed } from '../ui/bgVideoGate';
 import { night, nightFont } from '../ui/nightTheme';
@@ -79,6 +81,65 @@ export default function LivePlayerScreen() {
   }, [params.alt]);
 
   const urls = useMemo(() => [primary, ...alternates].filter((u) => /^https?:\/\//i.test(u)), [primary, alternates]);
+
+  /*
+   * CHANNEL_ZAP：在播放页里直接换台。
+   *
+   * 台单从本机缓存 `live:catalog` 读（直播页已经存下来了，不用重新拉 m3u），
+   * 再用和直播页一样的 filterLiveCatalog 过滤掉已删源，保证顺序、内容完全一致。
+   */
+  const [siblings, setSiblings] = useState<Array<{ id: string; name: string; group: string; url: string; urls: string[] }>>(
+    [],
+  );
+  useEffect(() => {
+    let alive = true;
+    void readCmsCache<{ catalog: unknown }>('live:catalog')
+      .then((cached) => {
+        if (!alive || !cached?.value?.catalog) return;
+        let cat: unknown = cached.value.catalog;
+        try {
+          cat = filterLiveCatalog(cat as never, store.liveSourceUrls) as never;
+        } catch {
+          /* 过滤失败就用原缓存 */
+        }
+        const box = cat as { channels?: Array<{ id: string; name: string; group: string; url: string; urls: string[] }> };
+        if (Array.isArray(box.channels)) setSiblings(box.channels);
+      })
+      .catch(() => undefined);
+    return () => {
+      alive = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  /** 当前台在台单里的位置（先按地址找，找不到再按名字找） */
+  const currentIndex = useMemo(() => {
+    if (siblings.length === 0) return -1;
+    const byUrl = siblings.findIndex((c) => c.urls?.includes(primary) || c.url === primary);
+    if (byUrl >= 0) return byUrl;
+    const byName = siblings.findIndex((c) => c.name === name);
+    return byName;
+  }, [siblings, primary, name]);
+
+  const zapTo = (offset: number) => {
+    if (siblings.length === 0 || currentIndex < 0) {
+      toast.show('台单还没加载出来，先回直播页刷新一下', 'warn');
+      return;
+    }
+    const next = siblings[(currentIndex + offset + siblings.length) % siblings.length];
+    if (!next) return;
+    const alt = (next.urls ?? []).slice(1);
+    setUrlIndex(0);
+    setAttempt((n) => n + 1);
+    setFailedAll(false);
+    setReport(null);
+    toast.show(`换台：${next.name}`);
+    router.replace(
+      `/live-player?id=${encodeURIComponent(next.id)}&name=${encodeURIComponent(next.name)}&group=${encodeURIComponent(
+        next.group,
+      )}&u=${encodeURIComponent(next.url)}${alt.length > 0 ? `&alt=${encodeURIComponent(JSON.stringify(alt))}` : ''}`,
+    );
+  };
 
   const [urlIndex, setUrlIndex] = useState(0);
   const [overlay, setOverlay] = useState(true);
@@ -172,6 +233,15 @@ export default function LivePlayerScreen() {
             <Pressable onPress={toggleFull} style={styles.fullBtn} hitSlop={12}>
               <Minimize2 size={18} color="#EAF4FF" strokeWidth={2} />
             </Pressable>
+            {/* 全屏也能换台 */}
+            <View style={styles.fullZapRow}>
+              <Pressable onPress={() => zapTo(-1)} style={styles.fullZapBtn} hitSlop={10}>
+                <Text style={styles.fullZapText}>‹</Text>
+              </Pressable>
+              <Pressable onPress={() => zapTo(1)} style={styles.fullZapBtn} hitSlop={10}>
+                <Text style={styles.fullZapText}>›</Text>
+              </Pressable>
+            </View>
           </>
         ) : (
           <Pressable onPress={toggleFull} style={styles.fullBtnSmall} hitSlop={12}>
@@ -214,6 +284,25 @@ export default function LivePlayerScreen() {
                   </Text>
                 </View>
               ) : null}
+
+              {/* 换台：左右各一个，连着点也不会迷路 */}
+              <View style={styles.zapRow}>
+                <Pressable
+                  onPress={() => zapTo(-1)}
+                  style={[styles.zapBtn, currentIndex < 0 ? { opacity: 0.45 } : null]}
+                >
+                  <Text style={styles.zapText}>‹ 上一个台</Text>
+                </Pressable>
+                <Text style={styles.zapPos} numberOfLines={1}>
+                  {currentIndex >= 0 ? `${currentIndex + 1} / ${siblings.length}` : '台单加载中…'}
+                </Text>
+                <Pressable
+                  onPress={() => zapTo(1)}
+                  style={[styles.zapBtn, currentIndex < 0 ? { opacity: 0.45 } : null]}
+                >
+                  <Text style={styles.zapText}>下一个台 ›</Text>
+                </Pressable>
+              </View>
 
               <View style={{ flexDirection: 'row', gap: 8 }}>
                 <Pressable
@@ -377,6 +466,35 @@ function fullBottom() {
 }
 
 const styles = StyleSheet.create({
+  zapRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginBottom: 8,
+  },
+  zapBtn: {
+    flex: 1,
+    paddingVertical: 10,
+    borderRadius: 12,
+    alignItems: 'center',
+    backgroundColor: 'rgba(87,248,255,0.16)',
+    borderWidth: 1,
+    borderColor: 'rgba(87,248,255,0.35)',
+  },
+  zapText: { color: '#EAF4FF', fontSize: 12.5, fontWeight: '800' },
+  zapPos: { color: 'rgba(234,244,255,0.55)', fontSize: 10.5, minWidth: 56, textAlign: 'center' },
+  fullZapRow: { position: 'absolute', right: 12, bottom: 64, flexDirection: 'row', gap: 8 },
+  fullZapBtn: {
+    width: 42,
+    height: 42,
+    borderRadius: 21,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'rgba(10,18,36,0.6)',
+    borderWidth: 1,
+    borderColor: 'rgba(87,248,255,0.4)',
+  },
+  fullZapText: { color: '#EAF4FF', fontSize: 20, fontWeight: '800', marginTop: -2 },
   root: { flex: 1, backgroundColor: '#000000' },
   stage: { flex: 1, justifyContent: 'center' },
   stageFull: { flex: 1, backgroundColor: '#000000' },

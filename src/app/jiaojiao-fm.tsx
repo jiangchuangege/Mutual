@@ -1,7 +1,17 @@
 ﻿import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useFocusEffect, usePathname, useRouter } from 'expo-router';
-import { createAudioPlayer, setAudioModeAsync, type AudioPlayer } from 'expo-audio';
-import { claimAudioFocus, registerAudioOwner, releaseAudioFocus, unregisterAudioOwner } from '../lib/audioFocus';
+import {
+  fmCurrentSec,
+  getFmState,
+  pauseFm,
+  playFm,
+  seekFm,
+  setFmRate,
+  setFmSleep,
+  stopFm,
+  subscribeFmEngine,
+  toggleFm,
+} from '../ui/fmEngine';
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
@@ -164,35 +174,17 @@ export default function JiaojiaoFmScreen() {
   const [playing, setPlaying] = useState<FmItem | null>(null);
   const [isPlaying, setIsPlaying] = useState(false);
 
-  const playerRef = useRef<AudioPlayer | null>(null);
-  /*
-   * HANDOFF_GUARD（真实 bug：「放 FM 时两个声音一起讲」）
-   *
-   * 迷你条点进播放页时，本页只是被 Stack 压在下面、并没有卸载：
-   *  - 播放页 claimAudioFocus 会把本页这一路 pause 掉（第一次）；
-   *  - 但播放页每 500ms 把进度写进空间（pushFmProgress），快照又回传给本页；
-   *  - 本页那段"跟 TA 同步"的 effect 看到 remote.playing && !isPlaying 就 p.play()，
-   *    于是本页这一路**从被暂停的位置又响起来**，和播放页那一路错位叠音。
-   *
-   * 所以交接出去之后（以及本页不在前台时），本页一律不许自己开播。
-   */
-  const handedOff = useRef(false);
-  const playingRef = useRef<FmItem | null>(null);
-  playingRef.current = playing;
+  /* FM 播放器在全局引擎（ui/fmEngine）里：这里只订阅，页面卸载也不会停声 */
+  const fm = React.useSyncExternalStore(subscribeFmEngine, getFmState, getFmState);
+  useEffect(() => {
+    setPlaying(fm.item);
+    setIsPlaying(fm.playing);
+  }, [fm.item, fm.playing]);
+
   /** 已经应用过的对方操作时间戳（避免来回拉扯） */
   const syncRef = useRef(0);
   /** 换集自动跟随：默认关（防止把你的播放抢走） */
   const [autoFollow, setAutoFollow] = useState(false);
-
-  // 音频模式：后台继续放、静音档也出声
-  useEffect(() => {
-    void setAudioModeAsync({
-      allowsRecording: false,
-      playsInSilentMode: true,
-      shouldPlayInBackground: true,
-      interruptionMode: 'duckOthers',
-    } as Parameters<typeof setAudioModeAsync>[0]).catch(() => undefined);
-  }, []);
 
   // 读回"自动跟随"设置
   useEffect(() => {
@@ -284,11 +276,8 @@ export default function JiaojiaoFmScreen() {
     void AsyncStorage.setItem(ITEMS_KEY, JSON.stringify(keep.slice(0, 600))).catch(() => undefined);
 
     if (playing && !keep.some((i) => i.key === playing.key)) {
-      try {
-        playerRef.current?.pause();
-      } catch {
-        /* 忽略 */
-      }
+      /* 正在放的那一集被删了：引擎里也停掉，别在后台继续响 */
+      stopFm();
       setPlaying(null);
       setIsPlaying(false);
     }
@@ -500,25 +489,6 @@ export default function JiaojiaoFmScreen() {
    * 别人（一起听的引擎、歌单试听）要出声时，FM 让路；
    * 离开页面时把原生播放器彻底释放，避免"声音还在放、界面却没有停止入口"。
    */
-  useEffect(() => {
-    registerAudioOwner(FM_OWNER, () => {
-      try {
-        playerRef.current?.pause();
-      } catch {
-        /* 忽略 */
-      }
-      setIsPlaying(false);
-    });
-    return () => {
-      unregisterAudioOwner(FM_OWNER);
-      releaseAudioFocus(FM_OWNER);
-      const p = playerRef.current;
-      playerRef.current = null;
-      killPlayer(p);
-      for (const extra of playersRef.current) killPlayer(extra);
-      playersRef.current = [];
-    };
-  }, []);
 
   /* REFRESH_ON_FOCUS：从「收听源」页回来时，源可能已经变了，立刻重拉一遍 */
   useFocusEffect(
@@ -529,22 +499,6 @@ export default function JiaojiaoFmScreen() {
   );
 
   /* 回到本页：解除交接锁，并把播放页停下的位置接回来（不然会跳回进播放页之前的进度） */
-  useFocusEffect(
-    React.useCallback(() => {
-      handedOff.current = false;
-      void AsyncStorage.getItem('jfm_resume_v1')
-        .then((raw) => {
-          if (!raw) return;
-          const box = JSON.parse(raw) as { audio?: string; positionSec?: number };
-          const p = playerRef.current;
-          const mine = playingRef.current;
-          if (!p || !mine || !box?.audio || box.audio !== mine.audio) return;
-          const at = Number(box.positionSec) || 0;
-          if (at > 0.5) void p.seekTo(at);
-        })
-        .catch(() => undefined);
-    }, []),
-  );
 
 
   /** 对方（TA）现在的 FM 进度：只有"最后操作者是 TA"时才算 TA 的状态 */
@@ -569,13 +523,12 @@ export default function JiaojiaoFmScreen() {
 
   /** 把"我现在这一秒"写进共享状态：TA 开着跟随便会跳过来 */
   const syncHere = () => {
-    const p = playerRef.current;
-    if (!playing || !p) {
+    if (!playing) {
       toast.show('先点一集开始听，再同步', 'warn');
       return;
     }
-    const at = Math.max(0, Number(p.currentTime) || 0);
-    store.pushFmProgress({ itemKey: playing.key, positionSec: at, rate: 1, playing: isPlaying });
+    const at = fmCurrentSec();
+    store.pushFmProgress({ itemKey: playing.key, positionSec: at, rate: fm.rate, playing: fm.playing });
     toast.show(`已同步到 ${fmtClock(at)}${autoFollow ? '' : '（提醒 TA 打开跟随）'}`);
   };
 
@@ -591,94 +544,26 @@ export default function JiaojiaoFmScreen() {
       toast.show('TA 听的那一集不在当前列表里（可能换了源）', 'warn');
       return;
     }
-    try {
-      claimAudioFocus(FM_OWNER);
-      killPlayer(playerRef.current);
-      playerRef.current = null;
-      const np = createAudioPlayer({ uri: target.audio });
-      playerRef.current = np;
-      rememberAndKillOthers(np);
-      void np.seekTo(Math.max(0, remote.positionSec));
-      if (remote.playing) np.play();
-      setPlaying(target);
-      setIsPlaying(remote.playing);
-      setAutoFollow(true);
-      toast.show(`已跟到 TA 的 ${fmtClock(remote.positionSec)}`);
-    } catch {
-      /* 地址失效就当没播 */
-    }
-  };
-
-  /**
-   * 彻底停掉一个播放器（换集 / 交接 / 卸载都要用）。
-   *
-   * FM_KILL_PLAYER：以前换集只 「remove()」、不 「pause()」。只要 remove 抛异常或没来得及生效，
-   * 旧的那一路会继续出声 —— 表现就是"点第 1 集再点第 2 集，两集一起放"。
-   * 这里先 pause、再把音量归零、最后 remove，任何一步失败都不影响下一步。
-   */
-  const killPlayer = (p: AudioPlayer | null | undefined) => {
-    if (!p) return;
-    try {
-      p.pause();
-    } catch {
-      /* 忽略 */
-    }
-    try {
-      p.volume = 0;
-    } catch {
-      /* 忽略 */
-    }
-    try {
-      (p as unknown as { remove?: () => void }).remove?.();
-    } catch {
-      /* 忽略 */
-    }
-  };
-
-  /** 所有创建过的播放器：换集时统一扫一遍，杜绝"漏杀"导致多路叠音 */
-  const playersRef = useRef<AudioPlayer[]>([]);
-  const rememberAndKillOthers = (next: AudioPlayer) => {
-    for (const old of playersRef.current) {
-      if (old !== next) killPlayer(old);
-    }
-    playersRef.current = [next];
+    playFm(target, { positionSec: remote.positionSec });
+    if (!remote.playing) pauseFm();
+    setAutoFollow(true);
+    void AsyncStorage.setItem('jfm_auto_follow', '1').catch(() => undefined);
+    toast.show(`已跟到 TA 的 ${fmtClock(remote.positionSec)}`);
   };
 
   const play = (item: FmItem) => {
+    playFm(item);
+    /* 一起听：告诉对方我在听这一集（进度由播放页/引擎每 500ms 续报） */
     try {
-      /*
-       * 1) 抢音频焦点：把「一起听」暂停掉（否则两段音频叠在一起——
-       *    引擎会一直在对账循环里 p.play()，光 pause FM 是没用的）。
-       * 2) 换集要把旧播放器 **remove 掉**：以前只 pause，旧实例带着原生 AudioTrack
-       *    一直留在内存里，来回换几次就变成多路声音 / Cannot create AudioTrack。
-       */
-      claimAudioFocus(FM_OWNER);
-      /* 先彻底停掉上一集，再建新的（顺序反过来的话，remove 慢一拍就变成两路同时响） */
-      killPlayer(playerRef.current);
-      playerRef.current = null;
-      const next = createAudioPlayer({ uri: item.audio });
-      playerRef.current = next;
-      rememberAndKillOthers(next);
-      next.play();
-      setPlaying(item);
-      setIsPlaying(true);
-      // 记住"上次听的是 FM"：首页只在这次是 FM 时才自动续播
-      void AsyncStorage.setItem('last_audio_surface', 'fm').catch(() => undefined);
-      // 记住"上次听的是 FM"：首页只在这次是 FM 时才自动续播
-      void AsyncStorage.setItem('last_audio_surface', 'fm').catch(() => undefined);
-      // 记住最后播放的这条：下次打开 App 自动续播
-      void AsyncStorage.setItem(
-        'jfm_last_track',
-        JSON.stringify({ audio: item.audio, title: item.title, album: item.album, cover: item.cover }),
-      ).catch(() => undefined);
-      try {
-        store.pushFmProgress({ itemKey: item.key, positionSec: 0, rate: 1, playing: true });
-      } catch {
-        /* 离线时忽略 */
-      }
+      store.pushFmProgress({ itemKey: item.key, positionSec: 0, rate: fm.rate, playing: true });
     } catch {
-      toast.show('这条音频播不了，可能地址失效了', 'error');
+      /* 离线忽略 */
     }
+    void AsyncStorage.setItem('last_audio_surface', 'fm').catch(() => undefined);
+    void AsyncStorage.setItem(
+      'jfm_last_track',
+      JSON.stringify({ audio: item.audio, title: item.title, album: item.album, cover: item.cover }),
+    ).catch(() => undefined);
   };
 
   const toggleFollow = () => {
@@ -688,92 +573,62 @@ export default function JiaojiaoFmScreen() {
     toast.show(next ? '已开启：TA 换集你这边跟着换' : '已关闭：各听各的，不互相打断');
   };
 
+  /** 暂停/继续：走全局引擎（同一套状态，全 App 一致） */
   const toggle = () => {
-    const p = playerRef.current;
-    if (!p) return;
-    try {
-      if (isPlaying) p.pause();
-      else p.play();
-      setIsPlaying(!isPlaying);
-      if (playing) {
-        try {
-          store.pushFmProgress({
-            itemKey: playing.key,
-            positionSec: Math.max(0, Number(p.currentTime) || 0),
-            rate: 1,
-            playing: !isPlaying,
-          });
-        } catch {
-          /* 离线时忽略 */
-        }
+    toggleFm();
+    if (playing) {
+      try {
+        store.pushFmProgress({
+          itemKey: playing.key,
+          positionSec: fmCurrentSec(),
+          rate: fm.rate,
+          playing: !fm.playing,
+        });
+      } catch {
+        /* 离线忽略 */
       }
-    } catch {
-      /* 忽略 */
     }
   };
 
-  /**
-   * 一起听：盯住空间里的进度。
-   * 规则和影院一致 —— 谁后操作听谁的；偏差 > 1.5 秒才强制 seek，避免两边互相拽。
+  /*
+   * 一起听：盯住空间里的进度（引擎在全局，页面切走也能跟着）。
+   *   · 只跟**对方**的进度（remote.role === role 直接跳过）；
+   *   · 对方换集 → 开了跟随便切过去；
+   *   · 同集时偏差 > 2.5 秒才 seek，避免两边互相对抽、把音频拽得一直缓冲。
    */
   useEffect(() => {
-    /* 交接给播放页 / 本页不在前台：这一路不许再出声（见 HANDOFF_GUARD） */
-    if (handedOff.current || pathname !== '/jiaojiao-fm') return;
+    if (pathname !== '/jiaojiao-fm') return;
     const remote = (snapshot as unknown as {
-      fmProgress?: { itemKey: string; positionSec: number; playing: boolean; role: 'A' | 'B'; updatedAt: number } | null;
+      fmProgress?: {
+        itemKey: string;
+        positionSec: number;
+        playing: boolean;
+        role: 'A' | 'B';
+        updatedAt: number;
+      } | null;
     }).fmProgress;
     if (!remote || !remote.itemKey) return;
-    /*
-     * FOLLOW_ONLY_PARTNER（真实 bug：「点进来他自己会播放，按钮却还显示播放」）：
-     * 这里以前不看 remote.role —— 我自己上次的进度也会被当成"要跟随"，
-     * 于是刚进页面就自动开播；而 isPlaying 取的是 remote.playing（我是暂停），
-     * 结果声音在放、按钮却显示"播放"。
-     */
     if (remote.role === role) return;
     if (remote.updatedAt <= syncRef.current) return;
-    const p = playerRef.current;
-    // 对方换集了：开了自动跟随便切过去，否则保持现状
+
     if (!playing || playing.key !== remote.itemKey) {
       if (!autoFollow) return;
       const target = items.find((i) => i.key === remote.itemKey);
       if (!target) {
-        /* 对方听的那一集不在本机列表里（换了源/还没拉到）—— 说一声，别静默 */
         toast.show('TA 听的那一集不在当前列表里，刷新一下收听源再试', 'warn');
         return;
       }
-      try {
-        claimAudioFocus(FM_OWNER);
-        killPlayer(playerRef.current);
-        playerRef.current = null;
-        const np = createAudioPlayer({ uri: target.audio });
-        playerRef.current = np;
-        rememberAndKillOthers(np);
-        void np.seekTo(Math.max(0, remote.positionSec));
-        /* 对方在放就跟着放；对方暂停就跟过去但不出声（状态和声音必须一致） */
-        if (remote.playing) np.play();
-        setPlaying(target);
-        setIsPlaying(remote.playing);
-        return;
-      } catch {
-        return;
-      }
+      syncRef.current = remote.updatedAt;
+      playFm(target, { positionSec: remote.positionSec });
+      if (!remote.playing) pauseFm();
+      return;
     }
-    if (!p) return;
+
     syncRef.current = remote.updatedAt;
-    try {
-      const cur = Number(p.currentTime) || 0;
-      if (Math.abs(cur - remote.positionSec) > 1.5) void p.seekTo(remote.positionSec);
-      if (remote.playing && !isPlaying) {
-        p.play();
-        setIsPlaying(true);
-      } else if (!remote.playing && isPlaying) {
-        p.pause();
-        setIsPlaying(false);
-      }
-    } catch {
-      /* 播放器还没准备好就跳过这一拍 */
-    }
-  }, [snapshot, playing, isPlaying]);
+    if (Math.abs(fmCurrentSec() - remote.positionSec) > 2.5) seekFm(remote.positionSec);
+    if (remote.playing && !fm.playing) toggleFm();
+    else if (!remote.playing && fm.playing) pauseFm();
+  }, [snapshot, playing, fm.playing, autoFollow, items, pathname]);
 
   /** 当前打开的合集名（null = 显示合集列表） */
   /** 选集分页：一页 20 条（用户要求：一行一集 + 显示标题 + 翻页） */
@@ -1091,25 +946,11 @@ export default function JiaojiaoFmScreen() {
             style={{ flex: 1 }}
             onPress={() => {
               /*
-               * FM_HANDOFF：进播放页之前把列表页这一路停掉，并把进度交接过去。
-               * 以前直接 push：Stack 不会卸载列表页，列表页的播放器还在放，
-               * 播放页又从头 createAudioPlayer → 同一集两路、带偏移地叠在一起。
+               * 进播放页：**不用再暂停交接**了 —— 播放器在全局引擎里，
+               * 列表页和播放页共用同一个实例，页面切换声音是连续的（不会两路叠音，也不会断）。
+               * 这里只把当前进度带过去，播放页一进来就能对上。
                */
-              const handoff = (() => {
-                const p = playerRef.current;
-                try {
-                  return Math.max(0, Number(p?.currentTime) || 0);
-                } catch {
-                  return 0;
-                }
-              })();
-              try {
-                playerRef.current?.pause();
-              } catch {
-                /* 忽略 */
-              }
-              handedOff.current = true;
-              setIsPlaying(false);
+              const handoff = fmCurrentSec();
               router.push({
                 pathname: '/jiaojiao-fm-player',
                 params: {
