@@ -974,6 +974,41 @@ async function handle(req, res) {
     return;
   }
 
+  /*
+   * FM_FEED_HOST：给焦焦FM 托管自建的 RSS / 列表 JSON（放在 server/static/ 下）。
+   *
+   * 为什么要有：用户手里常常是一段 XML（没有网址），或者干脆需要一份「放了很多年都不会失效」
+   * 的目录源 —— 挂在自己的服务器上，两台手机都直接按网址加源，还能一直更新。
+   * 只读、只允许文件名（不许 ../），没有任何账号信息。
+   */
+  if (req.method === 'GET' && url.pathname.startsWith('/fm/')) {
+    const name = url.pathname.slice('/fm/'.length).replace(/[^a-zA-Z0-9._-]/g, '');
+    const dir = path.join(path.dirname(fileURLToPath(import.meta.url)), 'static');
+    const file = path.join(dir, name);
+    if (!name || !file.startsWith(dir)) {
+      json(res, 404, { ok: false, error: 'not found' });
+      return;
+    }
+    try {
+      const body = fs.readFileSync(file);
+      const type = /\.json$/i.test(name)
+        ? 'application/json; charset=utf-8'
+        : /\.(rss|xml)$/i.test(name)
+          ? 'application/rss+xml; charset=utf-8'
+          : 'text/plain; charset=utf-8';
+      res.writeHead(200, {
+        'content-type': type,
+        'content-length': body.length,
+        'cache-control': 'public, max-age=300',
+        'access-control-allow-origin': '*',
+      });
+      res.end(body);
+    } catch {
+      json(res, 404, { ok: false, error: '这个节目单还没放上来' });
+    }
+    return;
+  }
+
   if (url.pathname === '/ping') {
     json(res, 200, {
       ok: true,
