@@ -155,26 +155,39 @@ export default function FmSourcesScreen() {
         Promise.race([
           (async () => {
             const t0 = Date.now();
-            const inline = isInlineUrl(s.url);
-            const body = inline ? await loadInlineText(s.url) : await (async () => {
-              const res = await fetch(s.url, { headers: { accept: '*/*' } });
-              if (!res.ok) throw new Error(`HTTP ${res.status}`);
-              return res.text();
-            })();
-            const items: FmItem[] = parseSource(body, s);
-            const ms = Date.now() - t0;
-            const catalogOnly = items.length > 0 && items.every((i) => i.externalOnly);
-            return {
-              url: s.url,
-              count: items.length,
-              ms,
-              error: items.length
-                ? catalogOnly
-                  ? '只有目录、没有音频链接（点一集会打开官方页面）'
-                  : null
-                : '这个源里没有条目',
-              status: (items.length === 0 ? 'fail' : ms > 4000 ? 'slow' : 'ok') as LiveScan['status'],
-            };
+            try {
+              const inline = isInlineUrl(s.url);
+              const body = inline
+                ? await loadInlineText(s.url)
+                : await (async () => {
+                    const res = await fetch(s.url, { headers: { accept: '*/*' } });
+                    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                    return res.text();
+                  })();
+              const items: FmItem[] = parseSource(body, s);
+              const ms = Date.now() - t0;
+              const catalogOnly = items.length > 0 && items.every((i) => i.externalOnly);
+              return {
+                url: s.url,
+                count: items.length,
+                ms,
+                error: items.length
+                  ? catalogOnly
+                    ? '只有目录、没有音频链接（点一集会打开官方页面）'
+                    : null
+                  : '这个源里没有条目',
+                status: (items.length === 0 ? 'fail' : ms > 4000 ? 'slow' : 'ok') as LiveScan['status'],
+              };
+            } catch (err) {
+              /* 单个源出错只让这一行显示「坏」，不能把整个检测 Promise.all 拖垮 */
+              return {
+                url: s.url,
+                count: 0,
+                ms: Date.now() - t0,
+                error: err instanceof Error ? err.message : String(err),
+                status: 'fail' as LiveScan['status'],
+              };
+            }
           })(),
           new Promise<LiveScan>((resolve) =>
             setTimeout(

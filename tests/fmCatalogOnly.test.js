@@ -92,3 +92,20 @@ test('条数上限仍然生效（不会因为改成目录型就吃掉几千条�
   const items = parseRss(many, 'src2');
   assert.equal(items.length, MAX_FM_ITEMS_PER_SOURCE);
 });
+
+test('列表 JSON 也支持「只有页面链接」的条目', () => {
+  const { parseListJson } = require('../dist-core/jiaojiaoFm.js');
+  const items = parseListJson(
+    JSON.stringify([
+      { title: '有音频的一集', url: 'https://cdn.example.com/a.mp3' },
+      { title: '只有页面的一集', link: 'https://www.ximalaya.com/sound/123' },
+      { title: '啥都没有的一集' },
+    ]),
+    'src3',
+  );
+  assert.equal(items.length, 2, '完全没地址的条目仍然丢掉');
+  assert.equal(items[0].audio, 'https://cdn.example.com/a.mp3');
+  assert.ok(!items[0].externalOnly);
+  assert.equal(items[1].externalOnly, true);
+  assert.equal(items[1].pageUrl, 'https://www.ximalaya.com/sound/123');
+});

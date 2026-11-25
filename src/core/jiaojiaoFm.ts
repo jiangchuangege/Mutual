@@ -310,16 +310,23 @@ export function parseListJson(text: string, sourceId: string): FmItem[] {
   for (const raw of arr) {
     if (!raw || typeof raw !== 'object') continue;
     const o = raw as Record<string, unknown>;
-    const audio = String(o.url ?? o.audio ?? o.src ?? o.playUrl ?? o.file ?? o.mp3 ?? '').trim();
-    if (!audio) continue;
+    const picked = String(o.url ?? o.audio ?? o.src ?? o.playUrl ?? o.file ?? o.mp3 ?? '').trim();
+    /* CATALOG_ONLY（JSON 版）：没给音频、只给了官方页面链接的条目也收，标 externalOnly */
+    const pageOnly = String(o.link ?? o.pageUrl ?? o.webUrl ?? '').trim();
+    const playable = picked && AUDIO_EXT.test(picked);
+    const audio = playable ? picked : '';
+    const pageUrl = playable ? null : /^https?:\/\//i.test(picked) ? picked : /^https?:\/\//i.test(pageOnly) ? pageOnly : '';
+    if (!audio && !pageUrl) continue;
     const title = String(o.title ?? o.name ?? o.bookName ?? o.chapter ?? '未命名').trim();
     out.push({
-      key: itemKey(audio),
+      key: itemKey(audio || pageUrl || ''),
       title: title || '未命名',
       album: String(o.album ?? o.channel ?? o.author ?? '').trim(),
       author: String(o.author ?? o.artist ?? o.narrator ?? '').trim(),
       cover: o.cover || o.pic || o.image ? String(o.cover ?? o.pic ?? o.image) : null,
       audio,
+      pageUrl: pageUrl || null,
+      externalOnly: !audio,
       duration: parseDuration(o.duration ?? o.time ?? o.length),
       summary: plainText(String(o.summary ?? o.desc ?? o.description ?? '')),
       publishedAt: Date.parse(String(o.publishedAt ?? o.date ?? o.pubDate ?? '')) || 0,
