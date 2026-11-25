@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="expo.modules.xmmedia" >
+
+    <uses-sdk android:minSdkVersion="24" />
+
+    <application>
+
+        <!--
+      媒体监听服务：Android 只允许「通知使用权」持有者读取别的 App 的 MediaSession。
+      我们用它读取并把两台设备的播放进度对齐（音频仍然在对方 App 里播放，不搬音频）。
+        -->
+        <service
+            android:name="expo.modules.xmmedia.MediaWatchService"
+            android:exported="true"
+            android:label="双人空间 · 播放进度"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE" >
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
+    </application>
+
+</manifest>

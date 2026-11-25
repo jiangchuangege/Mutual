@@ -39,6 +39,7 @@ import {
 import { Btn, Card, useToast } from '../ui/components';
 import { readCmsCache, writeCmsCache } from '../ui/cmsCache';
 import { isInlineUrl, loadInlineText } from '../ui/fmInline';
+import { ExternalPlayerCard } from '../ui/ExternalPlayerCard';
 import { useApp } from '../store';
 import { cleanEpisodeTitle, mergeProgress } from '../core/jiaojiaoFm';
 import { night, nightFont } from '../ui/nightTheme';
@@ -513,9 +514,12 @@ export default function JiaojiaoFmScreen() {
    */
 
   /* REFRESH_ON_FOCUS：从「收听源」页回来时，源可能已经变了，立刻重拉一遍 */
+  const [focused, setFocused] = useState(true);
   useFocusEffect(
     React.useCallback(() => {
+      setFocused(true);
       void refresh();
+      return () => setFocused(false);
       // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []),
   );
@@ -853,6 +857,17 @@ export default function JiaojiaoFmScreen() {
             />
           </View>
         </FmCard>
+
+        {/* 外部播放器：喜马拉雅在自己 App 里放，我们只读进度 + 对齐两台设备 */}
+        <ExternalPlayerCard
+          enabled={focused}
+          autoFollow={autoFollow}
+          partner={partnerFm ? { itemKey: partnerFm.itemKey, positionSec: partnerFm.positionSec, playing: partnerFm.playing, updatedAt: partnerFm.updatedAt } : null}
+          onPush={(input) =>
+            store.pushFmProgress({ itemKey: input.itemKey, positionSec: input.positionSec, rate: 1, playing: input.playing })
+          }
+          onToast={(t) => toast.show(t)}
+        />
 
         <View style={{ height: 14 }} />
 
