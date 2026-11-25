@@ -82,3 +82,8 @@ server/*.log
 *.themebak
 *.bgbak
 dist-core*
+
+# 本地原生模块的构建产物
+modules/*/android/build/
+modules/*/android/.cxx/
+

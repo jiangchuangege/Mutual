@@ -1,1 +1,0 @@
-Cache for Android Lint32.2.1_61c629c3e1ca10419626464cbeb368b2

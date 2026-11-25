@@ -1,9 +1,0 @@
-expo.modules.xmmedia.xm-media-pngs-0 C:\ts\modules\xm-media\android\build\generated\res\pngs\release
-expo.modules.xmmedia.xm-media-updated_navigation_xml-1 C:\ts\modules\xm-media\android\build\generated\updated_navigation_xml\release
-expo.modules.xmmedia.xm-media-mergeReleaseResources-2 C:\ts\modules\xm-media\android\build\intermediates\incremental\release\mergeReleaseResources\merged.dir
-expo.modules.xmmedia.xm-media-mergeReleaseResources-3 C:\ts\modules\xm-media\android\build\intermediates\incremental\release\mergeReleaseResources\stripped.dir
-expo.modules.xmmedia.xm-media-release-4 C:\ts\modules\xm-media\android\build\intermediates\merged_res\release\mergeReleaseResources
-expo.modules.xmmedia.xm-media-release-5 C:\ts\modules\xm-media\android\build\intermediates\packaged_res\release\packageReleaseResources
-expo.modules.xmmedia.xm-media-main-6 C:\ts\modules\xm-media\android\src\main\res
-expo.modules.xmmedia.xm-media-release-7 C:\ts\modules\xm-media\android\src\release\res
-gradleHome-0 C:\Users\Jiao\.gradle
