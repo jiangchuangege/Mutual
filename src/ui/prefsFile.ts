@@ -80,6 +80,41 @@ async function readFileEnvelope(key: string): Promise<Envelope | null> {
   }
 }
 
+/**
+ * 老版本塞进 AsyncStorage 的大块缓存 —— 现在它们都在文件缓存里了（ui/cmsCache）。
+ * Android 的 AsyncStorage 是 SQLite，库文件写满就报 SQLITE_FULL，**整个库都写不进去**，
+ * 连带账号会话/设备身份这些关键小数据一起失败。所以启动时按前缀清一遍。
+ */
+const LEGACY_BIG_PREFIXES = ['mutual_catpage_v1:', 'mutual_catmap_v1:'];
+const LEGACY_BIG_KEYS = ['jfm_items_v1'];
+const LEGACY_PRUNE_FLAG = 'twospace::legacy-prune-v1';
+
+async function removeLegacyBigKeys(): Promise<number> {
+  let removed = 0;
+  try {
+    const keys = await AsyncStorage.getAllKeys();
+    const targets = keys.filter(
+      (k) => LEGACY_BIG_KEYS.includes(k) || LEGACY_BIG_PREFIXES.some((p) => k.startsWith(p)),
+    );
+    if (targets.length > 0) {
+      await AsyncStorage.multiRemove(targets);
+      removed = targets.length;
+    }
+  } catch {
+    /* 删不动就算了 */
+  }
+  return removed;
+}
+
+/** 启动时清理一次老的大键（做过一次就不再查 key 列表，省 IO） */
+export async function pruneLegacyStorageOnce(): Promise<number> {
+  const done = await prefGet(LEGACY_PRUNE_FLAG);
+  if (done === '1') return 0;
+  const removed = await removeLegacyBigKeys();
+  await prefSet(LEGACY_PRUNE_FLAG, '1');
+  return removed;
+}
+
 async function freeSpaceForRetry(): Promise<void> {
   for (const key of PRUNABLE_KEYS) {
     try {
@@ -88,6 +123,8 @@ async function freeSpaceForRetry(): Promise<void> {
       /* 删不动就算了 */
     }
   }
+  // 还腾不出地方就把老的大块缓存也清掉
+  await removeLegacyBigKeys();
 }
 
 async function writeAsyncStorage(key: string, payload: string): Promise<boolean> {
@@ -170,9 +207,10 @@ export async function repairStorageOnce(): Promise<void> {
   try {
     await AsyncStorage.setItem(probe, '1');
     await AsyncStorage.removeItem(probe);
-    return;
   } catch {
     /* 满了，往下走 */
+    await freeSpaceForRetry();
   }
-  await freeSpaceForRetry();
+  // 不管探针成不成功，都顺手清掉老版本留下的大块缓存（它们的文件副本还在）
+  await pruneLegacyStorageOnce();
 }

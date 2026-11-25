@@ -26,6 +26,9 @@ import { loadLiveCatalog, type LiveCatalog } from '../core/liveLoad';
 import { readCmsCache, writeCmsCache } from './cmsCache';
 import { getApiCategories, resolveIdsForApi } from './cmsCatCache';
 
+/** 焦焦FM 条目的文件缓存键（AsyncStorage 那份是 6MB SQLite，装不下整库） */
+const FM_ITEMS_CACHE_KEY = 'fm:items';
+
 /** 单个接口最多缓存几页（再往后命中率极低，白占内存） */
 const PAGES_PER_API = 3;
 /** 单个接口缓存条目上限（AsyncStorage 单条有 2MB 上限，别写爆） */
@@ -294,7 +297,17 @@ export async function warmFm(sources: FmSource[], force = false, report?: WarmRe
   const list = sources.filter((s) => s && s.url && s.enabled !== false);
   if (list.length === 0) return 0;
 
-  const old = safeItems(await AsyncStorage.getItem(FM_ITEMS_KEY).catch(() => null));
+  /*
+   * 读取顺序：文件缓存（fm:items）→ 老的 AsyncStorage 键（只兼容老版本存下来的）。
+   * 写只写文件缓存：AsyncStorage 在 Android 是 6MB 的 SQLite 库，
+   * 一千多条 FM 条目一次就能把它写满，然后把账号会话之类的关键小数据一起写坏。
+   */
+  const fileBox = await readCmsCache<{ items?: FmItem[] }>(FM_ITEMS_CACHE_KEY).catch(() => null);
+  const fromFile = Array.isArray(fileBox?.value?.items) ? (fileBox!.value.items as FmItem[]) : [];
+  const old =
+    fromFile.length > 0
+      ? fromFile.filter((i) => i && i.key && i.audio)
+      : safeItems(await AsyncStorage.getItem(FM_ITEMS_KEY).catch(() => null));
   const covered = new Set(old.map((i) => i.sourceId));
   const todo = force ? list : list.filter((s) => !covered.has(s.id));
   if (todo.length === 0) {
@@ -329,7 +342,13 @@ export async function warmFm(sources: FmSource[], force = false, report?: WarmRe
     .filter((i) => (seen.has(i.key) ? false : (seen.add(i.key), true)))
     .sort((a, b) => (b.publishedAt || 0) - (a.publishedAt || 0))
     .slice(0, 1200);
-  await AsyncStorage.setItem(FM_ITEMS_KEY, JSON.stringify(combined)).catch(() => undefined);
+  await writeCmsCache(FM_ITEMS_CACHE_KEY, {
+    items: combined,
+    at: Date.now(),
+    sourceKey: list.map((s) => s.url).join('|'),
+  }).catch(() => undefined);
+  // 老的 AsyncStorage 副本留着只会把 6MB 的库继续撑满，直接删掉
+  void AsyncStorage.removeItem(FM_ITEMS_KEY).catch(() => undefined);
   return combined.length;
 }
 

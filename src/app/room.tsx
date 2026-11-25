@@ -1,4 +1,5 @@
 import { useRouter } from 'expo-router';
+import { LinearGradient } from 'expo-linear-gradient';
 import { setRoomDebug } from '../ui/roomDebug';
 
 /**
@@ -14,6 +15,7 @@ function baseTitleOf(input: string): string {
 }
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  Animated,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -61,6 +63,13 @@ const STATE_LABEL: Record<RoomState, string> = {
 
 /** 示例片源时长（真实产品里由用户自己填，或不填） */
 const DEMO_TOTAL_SEC = 90 * 60;
+
+/** 双人头像条里的状态文案：比状态机的枚举更口语 */
+function inPlaybackText(state: RoomState): string {
+  if (state === 'PLAYING') return '同步播放中';
+  if (state === 'PAUSED') return '一起暂停着';
+  return STATE_LABEL[state];
+}
 
 const REACTIONS: ReactionKind[] = ['lol', 'scared', 'ship', 'hug'];
 
@@ -463,6 +472,20 @@ export default function RoomScreen() {
     }
   };
 
+  /* 心跳：双人头像条中间那颗心轻轻跳一下（不夸张，只在 1.00~1.18 之间） */
+  const heart = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    const loop = Animated.loop(
+      Animated.sequence([
+        Animated.timing(heart, { toValue: 1, duration: 720, useNativeDriver: true }),
+        Animated.timing(heart, { toValue: 0, duration: 720, useNativeDriver: true }),
+      ]),
+    );
+    loop.start();
+    return () => loop.stop();
+  }, [heart]);
+  const heartScale = heart.interpolate({ inputRange: [0, 1], outputRange: [1, 1.18] });
+
   if (!room) {
     return (
       <View style={[styles.root, { backgroundColor: pageBg(color.bg) }, { paddingTop: insets.top + 12 }]}>
@@ -520,17 +543,48 @@ export default function RoomScreen() {
     <View style={[styles.root, { backgroundColor: pageBg(color.bg) }, { paddingTop: insets.top + 8 }]}>
       <NightBackdrop variant="cinema" video={false} />
       <View pointerEvents="none" style={{ position: 'absolute', left: 0, right: 0, top: 0, bottom: 0, backgroundColor: 'rgba(8,6,12,0.62)' }} />
+      {/*
+       * 房间头部：玻璃胶囊 + 双人头像条。
+       * 用户要求「这个房间内的 UI 全面升级、更浪漫」——原来是一个白底纯文字标题栏，
+       * 完全没有"两个人一起看电影"的感觉。现在是：
+       *   返回圆钮 · 「今晚一起看 EYEBROW」 · 片名 · 状态胶囊 · 设备胶囊
+       *   下面一条双人头像条：我的头像 💞 TA 的头像 + 同步状态（心跳微微跳）
+       */}
       <View style={styles.header}>
-        <Pressable onPress={() => router.back()} hitSlop={12}>
-          <Text style={[font.bodyStrong, { color: color.primaryInk }]}>‹ 返回</Text>
+        <Pressable onPress={() => router.back()} hitSlop={12} style={styles.backBtn}>
+          <Text style={styles.backInk}>‹</Text>
         </Pressable>
         <View style={{ flex: 1, alignItems: 'center' }}>
-          <Text style={[font.bodyStrong, { color: color.ink }]} numberOfLines={1}>
+          <Text style={styles.headerEyebrow}>今晚一起看</Text>
+          <Text style={styles.headerTitle} numberOfLines={1}>
             {room.state === 'RECAP' || room.state === 'ENDED' ? room.recap?.movieTitle ?? room.movieTitle : room.movieTitle}
           </Text>
-          <Text style={[font.tiny, { marginTop: 1 }]}>{STATE_LABEL[room.state]}</Text>
+          <View style={styles.headerStatePill}>
+            <View style={styles.headerStateDot} />
+            <Text style={styles.headerStateText}>{STATE_LABEL[room.state]}</Text>
+          </View>
         </View>
         <DevicePills />
+      </View>
+
+      {/* 双人头像条：谁在陪你看、同步到什么程度，一眼就看到 */}
+      <View style={styles.duoBar}>
+        <View style={[styles.duoAvatar, styles.duoAvatarMine]}>
+          <Text style={styles.duoAvatarInk}>{snapshot.members[role].avatar || '🐰'}</Text>
+        </View>
+        <Animated.Text style={[styles.duoHeart, { transform: [{ scale: heartScale }] }]}>💞</Animated.Text>
+        <View style={[styles.duoAvatar, styles.duoAvatarPeer]}>
+          <Text style={styles.duoAvatarInk}>{snapshot.members[partner].avatar || '🐻'}</Text>
+        </View>
+        <View style={{ flex: 1, marginLeft: 10 }}>
+          <Text style={styles.duoText} numberOfLines={1}>
+            {snapshot.members[partner].online ? 'TA 正在和你一起看' : 'TA 暂时不在线'}
+          </Text>
+          <Text style={styles.duoSub} numberOfLines={1}>
+            {inPlaybackText(room.state)} · 偏差 {m.drift >= 0 ? '+' : ''}
+            {m.drift.toFixed(2)}s
+          </Text>
+        </View>
       </View>
 
       {/*
@@ -541,43 +595,71 @@ export default function RoomScreen() {
        */}
       {room.sourceUrl ? (
         <View style={styles.playerDock}>
-          {playUrl ? null : (
-            <Text style={[font.tiny, { color: color.inkSoft, marginBottom: 6 }]}>
-              正在选择线路…
-            </Text>
-          )}
-          <MoviePlayer
-            url={playUrl ?? room.sourceUrl}
-            title={room.movieTitle}
-            rate={room.mediaState.rate}
-            onRateChange={(r) => store.setPlaybackRate(r)}
-            sourceSwitcher={
-              rankedAlternates.length > 1
-                ? {
-                    label: probing
-                      ? `换源 ${alternateIdx + 1}/${rankedAlternates.length} · 测速中`
-                      : `换源 ${alternateIdx + 1}/${rankedAlternates.length}`,
-                    onPress: switchSource,
-                  }
-                : undefined
-            }
-            danmaku={danmakuList}
-            onSeek={(sec) => store.seekRoom(sec)}
-            onPosition={(pos, playing) => store.syncDevicePosition(pos, playing)}
-            /* 同步已恢复：跟随端的"被拽回 0:00"由 MoviePlayer 里的 SYNC_NO_ZERO_PULL 兜住 */
-            sync={playerSync ?? undefined}
-            onStall={handleStall}
-            onError={(msg) => toast.show(msg, 'error')}
-          />
-          {/* 房间内选集 + 继续加片：不用退出房间 */}
-          <View style={{ flexDirection: 'row', gap: 8, marginTop: 6 }}>
-            <Btn
-              title={epOptions.length > 0 ? `选集（共 ${epOptions.length} 集）` : '选集'}
-              small
-              variant="soft"
-              onPress={() => setEpSheet((v) => !v)}
+          {/* 播放器外面套一圈"电影票根"外框：玫瑰色柔光 + 胶片齿孔，别再是块黑砖 */}
+          <View style={styles.playerShell}>
+            <LinearGradient
+              colors={['rgba(232,131,107,0.55)', 'rgba(179,164,224,0.35)', 'rgba(232,131,107,0.55)']}
+              start={{ x: 0, y: 0 }}
+              end={{ x: 1, y: 1 }}
+              style={styles.playerShellGlow}
             />
-
+            <View style={styles.playerInner}>
+              {playUrl ? null : (
+                <Text style={styles.pickingLine}>正在选择线路…</Text>
+              )}
+              <MoviePlayer
+                url={playUrl ?? room.sourceUrl}
+                title={room.movieTitle}
+                rate={room.mediaState.rate}
+                onRateChange={(r) => store.setPlaybackRate(r)}
+                sourceSwitcher={
+                  rankedAlternates.length > 1
+                    ? {
+                        label: probing
+                          ? `换源 ${alternateIdx + 1}/${rankedAlternates.length} · 测速中`
+                          : `换源 ${alternateIdx + 1}/${rankedAlternates.length}`,
+                        onPress: switchSource,
+                      }
+                    : undefined
+                }
+                danmaku={danmakuList}
+                onSeek={(sec) => store.seekRoom(sec)}
+                onPosition={(pos, playing) => store.syncDevicePosition(pos, playing)}
+                /* 同步已恢复：跟随端的"被拽回 0:00"由 MoviePlayer 里的 SYNC_NO_ZERO_PULL 兜住 */
+                sync={playerSync ?? undefined}
+                onStall={handleStall}
+                onError={(msg) => toast.show(msg, 'error')}
+              />
+            </View>
+            {/* 上下两条胶片齿孔：让这块区域像"正在放映"的电影票 */}
+            <View style={styles.filmEdgeTop} pointerEvents="none">
+              {Array.from({ length: 16 }).map((_, i) => (
+                <View key={`ft-${i}`} style={styles.filmHole} />
+              ))}
+            </View>
+            <View style={styles.filmEdgeBottom} pointerEvents="none">
+              {Array.from({ length: 16 }).map((_, i) => (
+                <View key={`fb-${i}`} style={styles.filmHole} />
+              ))}
+            </View>
+          </View>
+          {/* 房间内选集 + 加片：玻璃小胶囊，不再是一排白按钮 */}
+          <View style={styles.playerTools}>
+            <Pressable onPress={() => setEpSheet((v) => !v)} style={styles.toolChip}>
+              <Text style={styles.toolChipInk}>
+                {epOptions.length > 0 ? `🎞 选集 · ${epOptions.length} 集` : '🎞 选集'}
+              </Text>
+            </Pressable>
+            <Pressable onPress={() => router.push('/cinema-library')} style={styles.toolChip}>
+              <Text style={styles.toolChipInk}>＋ 加一部片</Text>
+            </Pressable>
+            <Pressable
+              onPress={() => void runProbe()}
+              disabled={probing || rankedAlternates.length < 2}
+              style={[styles.toolChip, probing ? { opacity: 0.5 } : null]}
+            >
+              <Text style={styles.toolChipInk}>{probing ? '测速中…' : '测速'}</Text>
+            </Pressable>
           </View>
           {epSheet ? (
             <View style={styles.episodeWrap}>
@@ -609,28 +691,16 @@ export default function RoomScreen() {
               )}
             </View>
           ) : null}
-          {/* 测速改成手动：默认只显示上次结果，想看新的点「测速」 */}
-          <View style={styles.probeRow}>
-            <Text style={[font.tiny, { flex: 1, color: color.inkSoft }]} numberOfLines={1}>
-              {probing
-                ? '正在测速…'
-                : probedAt
-                  ? `上次测速：${healthAgeText(probedAt)}${
-                      currentProbe?.ok ? ` · 当前源约 ${Math.round(currentProbe.kbps)} kbps` : ''
-                    }`
-                  : '还没测过速（卡的话可以点一次测速，会按速度排序）'}
-            </Text>
-            <Pressable
-              onPress={() => void runProbe()}
-              disabled={probing || rankedAlternates.length < 2}
-              hitSlop={8}
-              style={styles.probeBtn}
-            >
-              <Text style={[font.tiny, { color: color.primary, fontWeight: '700' }]}>
-                {probing ? '测速中' : '测速'}
-              </Text>
-            </Pressable>
-          </View>
+          {/* 上次测速结果：只做一行淡提示，按钮已经在上面的胶囊里了 */}
+          <Text style={styles.probeHint} numberOfLines={1}>
+            {probing
+              ? '正在测速…'
+              : probedAt
+                ? `上次测速：${healthAgeText(probedAt)}${
+                    currentProbe?.ok ? ` · 当前源约 ${Math.round(currentProbe.kbps)} kbps` : ''
+                  }`
+                : '卡的话点一下「测速」，会按速度重新排线路'}
+          </Text>
         </View>
       ) : null}
 
@@ -644,24 +714,38 @@ export default function RoomScreen() {
       {snapshot.watchQueue.length > 0 || true ? (
               <Card>
                 <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-                  <Text style={[font.bodyStrong, { flex: 1 }]}>
-                    一起看队列 · {snapshot.watchQueue.length} 项
-                  </Text>
-                  <Btn title="清空" small variant="ghost" onPress={() => store.clearWatchQueue()} />
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.sectionEyebrow}>TONIGHT&apos;S LIST</Text>
+                    <Text style={styles.sectionTitle}>今晚的片单</Text>
+                  </View>
+                  <View style={styles.countBadge}>
+                    <Text style={styles.countBadgeInk}>{snapshot.watchQueue.length}</Text>
+                  </View>
                   <View style={{ width: 6 }} />
-                  <Btn title="查看全部" small variant="ghost" onPress={() => router.push('/cinema-queue')} />
+                  <Pressable onPress={() => router.push('/cinema-queue')} hitSlop={8} style={styles.ghostChip}>
+                    <Text style={styles.ghostChipInk}>全部</Text>
+                  </Pressable>
+                  <View style={{ width: 6 }} />
+                  <Pressable onPress={() => store.clearWatchQueue()} hitSlop={8} style={styles.ghostChip}>
+                    <Text style={styles.ghostChipInk}>清空</Text>
+                  </Pressable>
                 </View>
-                <Text style={[font.tiny, { marginTop: 2 }]}>
-                  电视剧按合集折叠（不会一集一行）；点合集展开选集，点某一集立刻换片。
+                <Text style={styles.sectionHint}>
+                  电视剧按合集折叠；点合集展开选集，点某一集立刻换片。
                 </Text>
-                <View style={{ marginTop: 10 }}>
-                  {groupWatchQueue(snapshot.watchQueue).map((group) => {
+                <View style={{ marginTop: 12 }}>
+                  {groupWatchQueue(snapshot.watchQueue).map((group, gi) => {
                     const open = queueOpen === group.key;
                     const isPlaying = activeGroupKey(snapshot.watchQueue, room.sourceUrl) === group.key;
                     const first = group.items[0];
                     return (
-                      <View key={group.key}>
+                      <View key={group.key} style={styles.queueItem}>
                         <View style={styles.queueRow}>
+                          <View style={[styles.queueIndex, isPlaying ? styles.queueIndexOn : null]}>
+                            <Text style={[styles.queueIndexInk, isPlaying ? styles.queueIndexInkOn : null]}>
+                              {isPlaying ? '▶' : gi + 1}
+                            </Text>
+                          </View>
                           <Pressable
                             style={{ flex: 1 }}
                             onPress={() => {
@@ -673,15 +757,12 @@ export default function RoomScreen() {
                             }}
                           >
                             <Text
-                              style={[
-                                font.small,
-                                isPlaying ? { color: color.primaryInk, fontWeight: '700' } : null,
-                              ]}
+                              style={[styles.queueTitle, isPlaying ? { color: color.primaryInk } : null]}
                               numberOfLines={1}
                             >
-                              {(isPlaying ? '▶ ' : '') + group.title}
+                              {group.title}
                             </Text>
-                            <Text style={font.tiny}>
+                            <Text style={styles.queueMeta}>
                               {group.series ? `合集 · 共 ${group.items.length} 集` : '单片 · 点一下播'}
                               {group.series ? ` · ${open ? '点这里收起' : '点这里选集'}` : ''}
                             </Text>
@@ -692,16 +773,17 @@ export default function RoomScreen() {
                               style={styles.episodeChip}
                             >
                               <Text style={styles.episodeText}>
-                                {open ? '收起' : `选集（共 ${group.items.length} 集）`}
+                                {open ? '收起' : `选集 ${group.items.length}`}
                               </Text>
                             </Pressable>
                           ) : (
-                            <Btn
-                              title="移除"
-                              small
-                              variant="ghost"
+                            <Pressable
                               onPress={() => store.removeWatchQueue(first.id)}
-                            />
+                              hitSlop={8}
+                              style={styles.ghostChip}
+                            >
+                              <Text style={styles.ghostChipInk}>移除</Text>
+                            </Pressable>
                           )}
                         </View>
                         {group.series && open
@@ -727,7 +809,7 @@ export default function RoomScreen() {
                                     onPress={() => store.removeWatchQueue(item.id)}
                                     style={{ paddingHorizontal: 6 }}
                                   >
-                                    <Text style={[font.tiny, { color: color.inkSoft }]}>移除</Text>
+                                    <Text style={styles.queueMeta}>移除</Text>
                                   </Pressable>
                                 </View>
                               );
@@ -737,13 +819,10 @@ export default function RoomScreen() {
                     );
                   })}
                 </View>
-                <View style={{ height: 10 }} />
-                <Btn
-                  title="在房间里挑片（去在线片库）"
-                  small
-                  variant="soft"
-                  onPress={() => router.push('/cinema-library')}
-                />
+                <View style={{ height: 12 }} />
+                <Pressable onPress={() => router.push('/cinema-library')} style={styles.wideSoftBtn}>
+                  <Text style={styles.wideSoftBtnInk}>在房间里挑片 · 去在线片库</Text>
+                </Pressable>
               </Card>
             ) : (
               // 空队列也给一张卡：用户反馈"在房间里没法直接选片加进来"
@@ -1041,15 +1120,29 @@ export default function RoomScreen() {
             </View>
             )}
 
-            {/* 控制条 */}
-            <View style={styles.controlRow}>
-              <Btn title="−10s" small variant="ghost" style={{ flex: 1 }} onPress={() => onSeek(-10)} />
-              <Btn
-                title={room.mediaState.action === 'play' ? '暂停' : '播放'}
-                style={{ flex: 1.4 }}
-                onPress={onPressPlayPause}
-              />
-              <Btn title="+10s" small variant="ghost" style={{ flex: 1 }} onPress={() => onSeek(10)} />
+            {/* 控制条：一颗会发光的播放键 + 左右两边柔和的 ±10 秒 */}
+            <View style={styles.controlDock}>
+              <Pressable onPress={() => onSeek(-10)} style={({ pressed }) => [styles.skipBtn, pressed ? { opacity: 0.6 } : null]}>
+                <Text style={styles.skipInk}>−10s</Text>
+              </Pressable>
+              <Pressable onPress={onPressPlayPause} style={({ pressed }) => [styles.playBtnShadow, pressed ? { opacity: 0.9 } : null]}>
+                <LinearGradient
+                  colors={['#F2A085', '#E8836B', '#D4715A']}
+                  start={{ x: 0, y: 0 }}
+                  end={{ x: 1, y: 1 }}
+                  style={styles.playBtn}
+                >
+                  <Text style={styles.playBtnInk}>
+                    {room.mediaState.action === 'play' ? '⏸' : '▶'}
+                  </Text>
+                  <Text style={styles.playBtnLabel}>
+                    {room.mediaState.action === 'play' ? '暂停一下' : '和你一起播'}
+                  </Text>
+                </LinearGradient>
+              </Pressable>
+              <Pressable onPress={() => onSeek(10)} style={({ pressed }) => [styles.skipBtn, pressed ? { opacity: 0.6 } : null]}>
+                <Text style={styles.skipInk}>+10s</Text>
+              </Pressable>
             </View>
 
             {room.pendingLeadRequest === role ? (
@@ -1124,58 +1217,73 @@ export default function RoomScreen() {
               />
             </View>
 
-            {/* 弹幕与表情 */}
+            {/* 悄悄话：弹幕 + 表情，做成两个人之间的「聊天剧场」 */}
             <Card>
-              <Text style={font.bodyStrong}>私密弹幕</Text>
-              <Text style={[font.tiny, { marginTop: 2 }]}>
-                只有你们两人可见，绑定当前播放进度；不公开、不进任何广场。
-              </Text>
+              <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.sectionEyebrow}>WHISPER</Text>
+                  <Text style={styles.sectionTitle}>悄悄话</Text>
+                </View>
+                <View style={styles.privacyPill}>
+                  <Text style={styles.privacyPillInk}>仅我们两人可见</Text>
+                </View>
+              </View>
+              <Text style={styles.sectionHint}>落在当前播放进度上，不公开、不进任何广场。</Text>
               <View style={styles.danmakuInputRow}>
                 <TextInput
                   value={draft}
                   onChangeText={setDraft}
-                  placeholder="说一句（24 字以内）"
+                  placeholder="说一句悄悄话…（24 字以内）"
                   placeholderTextColor={color.inkFaint}
                   maxLength={24}
                   style={styles.danmakuInput}
                 />
-                <Btn
-                  title="发送"
-                  small
+                <Pressable
                   onPress={() => {
                     store.sendDanmaku(draft);
                     setDraft('');
                   }}
-                />
+                  style={({ pressed }) => [styles.sendBtn, pressed ? { opacity: 0.85 } : null]}
+                >
+                  <Text style={styles.sendBtnInk}>发送</Text>
+                </Pressable>
               </View>
-              <View style={{ marginTop: 10 }}>
+              <View style={{ marginTop: 12 }}>
                 {recentDanmaku.length === 0 ? (
-                  <Text style={[font.small]}>还没有弹幕。</Text>
+                  <Text style={styles.emptyHint}>还没有悄悄话。看片的时候想说点什么？</Text>
                 ) : (
-                  recentDanmaku.map((d) => (
-                    <View key={d.id} style={styles.danmakuRow}>
-                      <Text style={[font.tiny, { width: 46 }]}>{formatDuration(d.mediaPosSec)}</Text>
-                      <Text style={[font.small, { flex: 1 }]}>
-                        {d.senderRole === role ? '我' : snapshot.members[d.senderRole].name}：{d.text}
-                      </Text>
-                    </View>
-                  ))
+                  recentDanmaku.map((d) => {
+                    const mine = d.senderRole === role;
+                    return (
+                      <View key={d.id} style={[styles.bubbleRow, mine ? styles.bubbleRowMine : null]}>
+                        <View style={[styles.bubble, mine ? styles.bubbleMine : styles.bubblePeer]}>
+                          <Text style={[styles.bubbleText, mine ? styles.bubbleTextMine : null]}>
+                            {d.text}
+                          </Text>
+                          <Text style={[styles.bubbleTime, mine ? styles.bubbleTimeMine : null]}>
+                            {formatDuration(d.mediaPosSec)} ·{' '}
+                            {mine ? '我' : snapshot.members[d.senderRole].name}
+                          </Text>
+                        </View>
+                      </View>
+                    );
+                  })
                 )}
               </View>
-              <View style={{ flexDirection: 'row', gap: 8, marginTop: 12 }}>
+              <View style={{ flexDirection: 'row', gap: 8, marginTop: 14 }}>
                 {REACTIONS.map((r) => (
                   <Pressable
                     key={r}
                     onPress={() => store.sendReaction(r)}
-                    style={styles.reactionCell}
+                    style={({ pressed }) => [styles.reactionCell, pressed ? { opacity: 0.7 } : null]}
                   >
-                    <Text style={{ fontSize: 18 }}>{reactionMeta[r].emoji}</Text>
-                    <Text style={[font.tiny, { marginTop: 2 }]}>{reactionMeta[r].label}</Text>
+                    <Text style={{ fontSize: 20 }}>{reactionMeta[r].emoji}</Text>
+                    <Text style={styles.reactionLabel}>{reactionMeta[r].label}</Text>
                   </Pressable>
                 ))}
               </View>
-              <View style={{ marginTop: 8 }}>
-                <Text style={[font.tiny]}>
+              <View style={{ marginTop: 10 }}>
+                <Text style={styles.reactionTrail}>
                   最近反应：
                   {room.reactions.length === 0
                     ? ' 暂无'
@@ -1187,11 +1295,16 @@ export default function RoomScreen() {
               </View>
             </Card>
 
-            {/* 5.9 虚拟影院场景 */}
+            {/* 我们的小影院场景 */}
             <Card>
-              <Text style={font.bodyStrong}>虚拟影院</Text>
-              <Text style={[font.tiny, { marginTop: 2 }]}>只有 3 个可交互点，刻意不做过度装饰。</Text>
-              <View style={{ flexDirection: 'row', gap: 8, marginTop: 10 }}>
+              <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.sectionEyebrow}>OUR CINEMA</Text>
+                  <Text style={styles.sectionTitle}>我们的小影院</Text>
+                </View>
+              </View>
+              <Text style={styles.sectionHint}>点一下，两个人的座位就变了。</Text>
+              <View style={{ flexDirection: 'row', gap: 8, marginTop: 12 }}>
                 {([
                   ['popcorn', '🍿 爆米花', room.scene.popcorn],
                   ['cat', '🐈 猫', room.scene.cat],
@@ -1201,11 +1314,11 @@ export default function RoomScreen() {
                     key={key}
                     onPress={() => store.toggleScene(key)}
                     style={[
-                      styles.reactionCell,
-                      on ? { backgroundColor: color.primarySoft, borderColor: color.primary } : null,
+                      styles.sceneCell,
+                      on ? styles.sceneCellOn : null,
                     ]}
                   >
-                    <Text style={[font.tiny, { color: on ? color.primaryInk : color.inkSoft }]}>{label}</Text>
+                    <Text style={[styles.sceneCellInk, on ? { color: color.primaryInk } : null]}>{label}</Text>
                   </Pressable>
                 ))}
               </View>
@@ -1490,4 +1603,280 @@ const styles = StyleSheet.create({
     fontSize: 13,
     color: color.ink,
   },
+
+  /* ==================================================================
+   * 一起看房间的「浪漫版」视觉层（v3.14.23）
+   * 房间底是暗色影院壁纸，所以头部/头像条用玻璃+白字；
+   * 卡片仍然是中性白玻璃（surf('base') 的纸白），不带一点黄。
+   * ================================================================== */
+  backBtn: {
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'rgba(255,255,255,0.16)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.3)',
+  },
+  backInk: { color: '#FFFFFF', fontSize: 20, fontWeight: '700', marginTop: -2 },
+  headerEyebrow: {
+    fontSize: 9,
+    letterSpacing: 2.4,
+    fontWeight: '700',
+    color: 'rgba(255,255,255,0.58)',
+  },
+  headerTitle: {
+    fontSize: 17,
+    fontWeight: '700',
+    color: '#FFFFFF',
+    marginTop: 1,
+    maxWidth: 240,
+  },
+  headerStatePill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
+    marginTop: 4,
+    paddingHorizontal: 9,
+    paddingVertical: 2,
+    borderRadius: 999,
+    backgroundColor: 'rgba(255,255,255,0.16)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.26)',
+  },
+  headerStateDot: { width: 5, height: 5, borderRadius: 3, backgroundColor: '#8FE0C0' },
+  headerStateText: { fontSize: 10, fontWeight: '600', color: 'rgba(255,255,255,0.86)' },
+
+  duoBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginHorizontal: space.lg,
+    marginTop: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 9,
+    borderRadius: 20,
+    backgroundColor: 'rgba(255,255,255,0.13)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.24)',
+  },
+  duoAvatar: {
+    width: 30,
+    height: 30,
+    borderRadius: 15,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1.5,
+  },
+  duoAvatarMine: { borderColor: 'rgba(255,255,255,0.75)', backgroundColor: 'rgba(255,255,255,0.22)' },
+  duoAvatarPeer: { borderColor: 'rgba(232,131,107,0.9)', backgroundColor: 'rgba(232,131,107,0.24)' },
+  duoAvatarInk: { fontSize: 15 },
+  duoHeart: { fontSize: 13, marginHorizontal: -3, marginTop: 8 },
+  duoText: { fontSize: 12.5, fontWeight: '700', color: '#FFFFFF' },
+  duoSub: { fontSize: 10.5, fontWeight: '500', color: 'rgba(255,255,255,0.66)', marginTop: 1 },
+
+  playerShell: {
+    borderRadius: 26,
+    padding: 3,
+    overflow: 'hidden',
+    backgroundColor: 'rgba(255,255,255,0.1)',
+    shadowColor: '#E8836B',
+    shadowOpacity: 0.35,
+    shadowRadius: 16,
+    shadowOffset: { width: 0, height: 8 },
+    elevation: 8,
+  },
+  playerShellGlow: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    top: 0,
+    bottom: 0,
+    opacity: 0.55,
+  },
+  playerInner: { borderRadius: 23, overflow: 'hidden', backgroundColor: '#120E12' },
+  pickingLine: {
+    fontSize: 10.5,
+    fontWeight: '600',
+    color: 'rgba(255,255,255,0.6)',
+    paddingHorizontal: 12,
+    paddingTop: 6,
+  },
+  filmEdgeTop: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    paddingHorizontal: 8,
+    paddingTop: 4,
+    paddingBottom: 3,
+  },
+  filmEdgeBottom: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    paddingHorizontal: 8,
+    paddingBottom: 4,
+    paddingTop: 3,
+  },
+  filmHole: {
+    width: 8,
+    height: 4,
+    borderRadius: 1.5,
+    backgroundColor: 'rgba(255,255,255,0.22)',
+  },
+  playerTools: { flexDirection: 'row', gap: 8, marginTop: 10 },
+  toolChip: {
+    paddingHorizontal: 11,
+    paddingVertical: 6,
+    borderRadius: 999,
+    backgroundColor: 'rgba(255,255,255,0.16)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.28)',
+  },
+  toolChipInk: { fontSize: 11, fontWeight: '700', color: 'rgba(255,255,255,0.92)' },
+  probeHint: {
+    fontSize: 10,
+    fontWeight: '500',
+    color: 'rgba(255,255,255,0.48)',
+    marginTop: 8,
+  },
+
+  sectionEyebrow: {
+    fontSize: 8.5,
+    letterSpacing: 2,
+    fontWeight: '700',
+    color: color.inkFaint,
+  },
+  sectionTitle: { fontSize: 16, fontWeight: '700', color: color.ink, marginTop: 2 },
+  sectionHint: { fontSize: 11, fontWeight: '400', color: color.inkSoft, marginTop: 6, lineHeight: 16 },
+  countBadge: {
+    minWidth: 24,
+    height: 24,
+    borderRadius: 12,
+    paddingHorizontal: 6,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: color.primarySoft,
+  },
+  countBadgeInk: { fontSize: 11.5, fontWeight: '700', color: color.primaryInk },
+  ghostChip: {
+    paddingHorizontal: 9,
+    paddingVertical: 4,
+    borderRadius: 999,
+    backgroundColor: 'rgba(255,255,255,0.7)',
+    borderWidth: 1,
+    borderColor: color.line,
+  },
+  ghostChipInk: { fontSize: 10.5, fontWeight: '600', color: color.inkSoft },
+
+  queueItem: { marginTop: 4 },
+  queueIndex: {
+    width: 22,
+    height: 22,
+    borderRadius: 11,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'rgba(255,255,255,0.9)',
+    borderWidth: 1,
+    borderColor: color.line,
+    marginRight: 9,
+  },
+  queueIndexOn: { backgroundColor: color.primary, borderColor: color.primary },
+  queueIndexInk: { fontSize: 10.5, fontWeight: '700', color: color.inkSoft },
+  queueIndexInkOn: { color: '#FFFFFF' },
+  queueTitle: { fontSize: 13, fontWeight: '600', color: color.ink },
+  queueMeta: { fontSize: 10.5, fontWeight: '500', color: color.inkSoft, marginTop: 1 },
+  wideSoftBtn: {
+    alignItems: 'center',
+    paddingVertical: 10,
+    borderRadius: 999,
+    backgroundColor: 'rgba(232,131,107,0.12)',
+    borderWidth: 1,
+    borderColor: 'rgba(232,131,107,0.35)',
+  },
+  wideSoftBtnInk: { fontSize: 12, fontWeight: '700', color: color.primaryInk },
+
+  controlDock: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 12,
+    marginBottom: space.md,
+  },
+  skipBtn: {
+    minWidth: 72,
+    alignItems: 'center',
+    paddingVertical: 11,
+    borderRadius: 999,
+    backgroundColor: 'rgba(255,255,255,0.16)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.26)',
+  },
+  skipInk: { fontSize: 12, fontWeight: '700', color: 'rgba(255,255,255,0.9)' },
+  playBtnShadow: {
+    flex: 1,
+    borderRadius: 999,
+    shadowColor: '#E8836B',
+    shadowOpacity: 0.45,
+    shadowRadius: 16,
+    shadowOffset: { width: 0, height: 8 },
+    elevation: 10,
+  },
+  playBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 7,
+    paddingVertical: 13,
+    borderRadius: 999,
+  },
+  playBtnInk: { fontSize: 15, color: '#FFFFFF', fontWeight: '700' },
+  playBtnLabel: { fontSize: 12.5, color: 'rgba(255,255,255,0.95)', fontWeight: '700' },
+
+  privacyPill: {
+    paddingHorizontal: 9,
+    paddingVertical: 3,
+    borderRadius: 999,
+    backgroundColor: color.mintSoft,
+  },
+  privacyPillInk: { fontSize: 10, fontWeight: '700', color: color.ok },
+  sendBtn: {
+    paddingHorizontal: 16,
+    paddingVertical: 9,
+    borderRadius: 999,
+    backgroundColor: color.primary,
+  },
+  sendBtnInk: { fontSize: 12, fontWeight: '700', color: '#FFFFFF' },
+  emptyHint: { fontSize: 11.5, color: color.inkFaint, fontWeight: '500' },
+  bubbleRow: { flexDirection: 'row', marginBottom: 7 },
+  bubbleRowMine: { justifyContent: 'flex-end' },
+  bubble: { maxWidth: '82%', paddingHorizontal: 12, paddingVertical: 8, borderRadius: 16 },
+  bubblePeer: {
+    backgroundColor: 'rgba(255,255,255,0.92)',
+    borderWidth: 1,
+    borderColor: color.line,
+    borderBottomLeftRadius: 5,
+  },
+  bubbleMine: {
+    backgroundColor: 'rgba(232,131,107,0.14)',
+    borderWidth: 1,
+    borderColor: 'rgba(232,131,107,0.3)',
+    borderBottomRightRadius: 5,
+  },
+  bubbleText: { fontSize: 12.5, color: color.ink, fontWeight: '500', lineHeight: 18 },
+  bubbleTextMine: { color: color.primaryInk },
+  bubbleTime: { fontSize: 9, color: color.inkFaint, marginTop: 3, fontWeight: '500' },
+  bubbleTimeMine: { color: 'rgba(140,70,52,0.55)' },
+  reactionLabel: { fontSize: 10, fontWeight: '600', color: color.inkSoft, marginTop: 3 },
+  reactionTrail: { fontSize: 10.5, fontWeight: '500', color: color.inkFaint },
+
+  sceneCell: {
+    flex: 1,
+    alignItems: 'center',
+    paddingVertical: 11,
+    borderRadius: 16,
+    backgroundColor: 'rgba(255,255,255,0.72)',
+    borderWidth: 1,
+    borderColor: color.line,
+  },
+  sceneCellOn: { backgroundColor: color.primarySoft, borderColor: 'rgba(232,131,107,0.55)' },
+  sceneCellInk: { fontSize: 11.5, fontWeight: '600', color: color.inkSoft },
 });

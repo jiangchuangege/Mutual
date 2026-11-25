@@ -2501,8 +2501,16 @@ export class Hub {
     }
     let changed = false;
     const drift = Math.abs(room.mediaState.positionSec - positionSec);
-    if (drift > 3) {
-      // 主控的真实播放器偏差过大（用户拖动了本地播放器）→ 服务端跟随主控
+    /*
+     * HEARTBEAT_GLUE：以前阈值是 3 秒 —— 服务端位置按服务器时钟自己往前走，
+     * 只有偏离主控真实播放位置 3 秒以上才拉回来。可采集站的片子几秒卡一下是常态，
+     * 于是服务端位置就成了「每几秒往前窜一点、再被拽回 3 秒」的锯齿。
+     * 跟随方照着这条锯齿校准，表现就是用户看到的「进度一直跳」「一会一样一会往回缩」。
+     * 现在缩到 0.8 秒：服务端的权威位置几乎贴着主控的真实播放位置，
+     * 跟随方看到的是一条平滑的线（这点抖动落在跟随方的死区里，不会触发 seek）。
+     */
+    if (drift > 0.8) {
+      // 主控的真实播放器偏差过大（用户拖动了本地播放器 / 片子卡了一下）→ 服务端跟随主控
       room.mediaState.positionSec = Math.max(0, positionSec);
       room.mediaState.seq += 1;
       changed = true;

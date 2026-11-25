@@ -15,31 +15,33 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 
 import { canonicalBucket, matchesSubCategory, type BucketKey } from '../core/cinemaClassify';
 import { fetchCmsCategories, fetchCmsCategoryPage, type CmsCategory, type CmsVod } from '../core/cms';
+import { readCmsCache, writeCmsCache } from './cmsCache';
 
 const MAP_PREFIX = 'mutual_catmap_v1:';
 const PAGE_PREFIX = 'mutual_catpage_v1:';
 /** 单个分类页最多留多少条（20 一页就够铺两屏，省空间） */
 const PAGE_CAP = 60;
-/** 每个接口的分类表缓存的版本：分类改名/加类时 bump 一下即可 */
-const PAGE_MAX_KEYS = 400;
 
 const mapMemory = new Map<string, CmsCategory[]>();
 
+/*
+ * STORAGE_MOVED_TO_FILE：这里以前往 AsyncStorage 写。
+ *
+ * Android 上 AsyncStorage 用的是 SQLite，库文件有上限（我们实测 6MB 左右就报
+ * `database or disk is full (code 13 SQLITE_FULL)`），而分类页缓存是"每个接口 × 每个分类
+ * 一份"，几百份叠起来轻松几个 MB —— 一旦写满，**整个 AsyncStorage 都写不进去**，
+ * 连带账号会话、设备身份这些关键小数据也一起失败（表现：明明进来了却显示没进来）。
+ *
+ * 现在全部落到 cmsCache 的**文件级缓存**（documentDirectory/cmscache，容量只受手机空间限制），
+ * 键名保持不变，所以旧文件缓存和 APK 里的种子缓存照样命中。
+ */
 async function readJson<T>(key: string): Promise<T | null> {
-  try {
-    const raw = await AsyncStorage.getItem(key);
-    return raw ? (JSON.parse(raw) as T) : null;
-  } catch {
-    return null;
-  }
+  const hit = await readCmsCache<T>(key).catch(() => null);
+  return hit ? hit.value : null;
 }
 
 async function writeJson(key: string, value: unknown): Promise<void> {
-  try {
-    await AsyncStorage.setItem(key, JSON.stringify(value));
-  } catch {
-    /* 存不下就下次再拉 */
-  }
+  await writeCmsCache(key, value).catch(() => undefined);
 }
 
 /** 拿某个接口的分类表（内存 -> 本地缓存 -> 网络），永久有效 */
@@ -185,13 +187,16 @@ export async function fetchCachedCategoryPage(
   return info.list;
 }
 
-/** 只保留最近用到的 N 个分类页，避免无限长（其余永久保留） */
+/**
+ * 迁移清理：老版本把分类页/分类表写在 AsyncStorage 里，把那个 6MB 的库撑爆了。
+ * 现在这些数据都在文件缓存里，所以把老键删掉，给真正重要的数据（账号会话）腾地方。
+ * 删了不会丢东西：下次点进分类会重新拉一遍，然后写回文件缓存。
+ */
 export async function pruneCategoryPages(): Promise<void> {
   try {
     const keys = await AsyncStorage.getAllKeys();
-    const mine = keys.filter((k) => k.startsWith(PAGE_PREFIX));
-    if (mine.length <= PAGE_MAX_KEYS) return;
-    await AsyncStorage.multiRemove(mine.slice(0, mine.length - PAGE_MAX_KEYS));
+    const legacy = keys.filter((k) => k.startsWith(PAGE_PREFIX) || k.startsWith(MAP_PREFIX));
+    if (legacy.length > 0) await AsyncStorage.multiRemove(legacy);
   } catch {
     /* 忽略 */
   }

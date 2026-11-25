@@ -127,3 +127,60 @@ export function computeTargetPosition(
   const elapsedSec = Math.max(0, (serverNowMs - media.updatedAtServerMs) / 1000);
   return media.positionSec + elapsedSec * media.rate;
 }
+
+/**
+ * 一起看（房间）跟随端的校准闸门。
+ *
+ * 用户实测：「我女朋友加入我房间后，她那边一会儿跟我进度一样、一会儿又往回缩」。
+ * 两个原因叠在一起：
+ *  1. 目标位置是用**快照那一刻**的 serverNow 算的，可主控每 2 秒才心跳一次、
+ *     快照也是 2 秒一次 —— 中间算出来的目标永远慢半拍，于是在"对齐"和"落后"之间反复；
+ *  2. 旧阈值是对称的 1.5 秒：只要超前 1.6 秒就往回拖。往回跳最伤观感，
+ *     而且播放器解码抖动本身就有几百毫秒。
+ *
+ * 现在：落后 2 秒立刻追（晚一点看不出来），超前要 6 秒以上才往回拉，
+ * 两次 seek 至少隔 6 秒 —— 宁可慢半拍跟着，也不来回抽搐。
+ */
+export const ROOM_SYNC_GATE = {
+  /** 目标位置小于这个值认为主控还没真正开播，不去校准（避免被拽回 0:00） */
+  MIN_TARGET_SEC: 1.5,
+  /** 落后多少秒开始追 */
+  LATE_SEC: 2,
+  /** 超前多少秒才允许往回拉 */
+  EARLY_SEC: 6,
+  /** 两次 seek 的最小间隔 */
+  MIN_GAP_MS: 6000,
+} as const;
+
+export type RoomSyncReason = 'no-target' | 'in-sync' | 'lag' | 'lead' | 'too-soon';
+
+export interface RoomSyncDecision {
+  /** 是否应该 seek 到 targetSec */
+  seek: boolean;
+  /** 算出来的目标位置（已按 mediaState 推演到"此刻"） */
+  targetSec: number;
+  /** 当前播放位置 - 目标位置；> 0 表示本地超前 */
+  driftSec: number;
+  reason: RoomSyncReason;
+}
+
+/** 房间跟随端：判断此刻要不要 seek、往哪儿 seek */
+export function decideRoomSync(
+  curSec: number,
+  targetSec: number,
+  msSinceLastSeek: number,
+): RoomSyncDecision {
+  const driftSec = curSec - targetSec;
+  if (!(targetSec >= ROOM_SYNC_GATE.MIN_TARGET_SEC)) {
+    return { seek: false, targetSec, driftSec, reason: 'no-target' };
+  }
+  const late = driftSec < 0 && Math.abs(driftSec) > ROOM_SYNC_GATE.LATE_SEC;
+  const early = driftSec > 0 && Math.abs(driftSec) > ROOM_SYNC_GATE.EARLY_SEC;
+  if (!late && !early) {
+    return { seek: false, targetSec, driftSec, reason: 'in-sync' };
+  }
+  if (msSinceLastSeek < ROOM_SYNC_GATE.MIN_GAP_MS) {
+    return { seek: false, targetSec, driftSec, reason: 'too-soon' };
+  }
+  return { seek: true, targetSec, driftSec, reason: late ? 'lag' : 'lead' };
+}

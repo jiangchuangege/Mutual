@@ -1,5 +1,5 @@
 import * as ScreenOrientation from 'expo-screen-orientation';
-import { computeTargetPosition } from '../core/drift';
+import { computeTargetPosition, decideRoomSync } from '../core/drift';
 import { useVideoPlayer, VideoView } from 'expo-video';
 
 import { claimAudioFocus, releaseAudioFocus } from '../lib/audioFocus';
@@ -214,6 +214,8 @@ function MoviePlayerInner({
   syncRef.current = sync;
   /** 上一次"因为偏差太大而 seek"的时间：seek 一定会卡一下，必须限流 */
   const lastSeekAt = useRef(0);
+  /** 连续多少次 tick 判定"该校准"（见 SYNC_PERSIST：小偏差要连续两次） */
+  const pendingDriftRef = useRef(0);
   /** 卡顿累计时间：应该播却没往前走超过 3 秒就报一次（房间页据此自动换源） */
   const stalledMs = useRef(0);
   const lastStallAt = useRef(0);
@@ -311,25 +313,49 @@ function MoviePlayerInner({
 
         // 同步校准
         if (!sync.isLeader) {
-          const target = computeTargetPosition(sync.mediaState, sync.serverNow);
+          const target = computeTargetPosition(sync.mediaState, serverNowNow());
           const cur = pos;
           const d = cur - target;
           setDrift((prev) => (Math.abs(prev - d) < 0.2 ? prev : d));
           /*
-           * SYNC_NO_ZERO_PULL：房间位置还没被主控上报过时，mediaState.positionSec 是 0。
-           * 之前这里照单全收，跟随端就会每 4 秒被拽回 0:00，
-           * 表现就是"进度条一直停在 00:00、总时长还在变"。
-           * 现在：目标位置 < 1.5 秒一律不 seek（没有哪部片是从 0.0 秒开始对齐的），
-           * 只有主控真的报出一个有效位置才校准。
+           * SYNC_NO_ZERO_PULL / SYNC_ASYMMETRIC_TOLERANCE 的判定全部收在
+           * core/drift.ts 的 decideRoomSync 里（可被单测覆盖）：
+           *  - 目标 < 1.5 秒一律不 seek，避免还没开播就被拽回 0:00；
+           *  - 落后 2 秒就追，超前要 6 秒才往回拉（往回跳最伤观感）；
+           *  - 两次 seek 至少隔 6 秒。
            */
-          const targetUsable = target >= 1.5;
-          if (targetUsable && Math.abs(d) > 2.5 && Date.now() - lastSeekAt.current > 4000) {
-            lastSeekAt.current = Date.now();
-            try {
-              (player as unknown as { currentTime: number }).currentTime = target;
-            } catch {
-              // 忽略瞬时 seek 失败
+          const decision = decideRoomSync(cur, target, Date.now() - lastSeekAt.current);
+          if (decision.seek) {
+            /*
+             * SYNC_PERSIST：小偏差要"连续两次都偏"才动手。
+             * 服务端位置是台阶式的（主控心跳每 2 秒落一次），偶尔会有 1~2 秒的
+             * 瞬时台阶；每一次都追就成了"进度一直跳"。大偏差（>10 秒，例如主控
+             * 刚拖到别的位置、或换了片）不等，立刻对齐。
+             */
+            const big = Math.abs(decision.driftSec) > 10;
+            pendingDriftRef.current = big ? 2 : pendingDriftRef.current + 1;
+            if (pendingDriftRef.current >= 2) {
+              pendingDriftRef.current = 0;
+              lastSeekAt.current = Date.now();
+              /*
+               * SYNC_PENDING_WHILE_LOADING：播放器还没拿到时长（换源/缓冲中）时
+               * seek 会被直接丢掉 —— 以前每个 6 秒都去拽一次还没起来的播放器，
+               * 结果就是"一直在加载、进度还一直跳"。这里改成记下来，等真的能播了再跳。
+               */
+              if (!ready || dur <= 0) {
+                pendingSeekRef.current = target;
+              } else {
+                try {
+                  (player as unknown as { currentTime: number }).currentTime = target;
+                  setPosition(target);
+                  setDrift(0);
+                } catch {
+                  // 忽略瞬时 seek 失败，下一轮再来
+                }
+              }
             }
+          } else {
+            pendingDriftRef.current = 0;
           }
           if (sync.mediaState.action === 'play' && !isPlaying) {
             try {
@@ -428,6 +454,23 @@ function MoviePlayerInner({
   const [scrubTarget, setScrubTarget] = useState<number | null>(null);
   const videoWidth = useRef(1);
   const livePos = useRef(0);
+  /*
+   * SYNC_SERVERNOW_FRESH：sync.serverNow 是**快照那一刻**的服务端时间。
+   * 每 2 秒才来一次快照，中间它就不动了；而跟随端本地一直在走，
+   * 于是算出来的"应该到哪了"永远慢半拍 → 每隔几秒被往回 seek 一次
+   * （表现：一会儿跟我一样、一会儿又往回缩）。
+   * 这里记下拿到它的本地时刻，用本地流逝时间把它往前推，等于一个平滑的服务端时钟。
+   */
+  const serverNowSeenAt = useRef(Date.now());
+  const serverNowSeenValue = useRef(sync?.serverNow ?? 0);
+  useEffect(() => {
+    if (!sync) return;
+    serverNowSeenAt.current = Date.now();
+    serverNowSeenValue.current = sync.serverNow;
+  }, [sync?.serverNow]);
+  /** 估算"现在"的服务端时间（毫秒） */
+  const serverNowNow = () =>
+    serverNowSeenValue.current + Math.max(0, Date.now() - serverNowSeenAt.current);
   const liveDur = useRef(0);
   const livePlaying = useRef(false);
   livePos.current = position;
@@ -489,6 +532,38 @@ function MoviePlayerInner({
   // 双击左右半边快退/快进 10 秒；单击放大（和以前一样）
   const lastTap = useRef(0);
   const tapTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /**
+   * 单击画面 = 显示/隐藏控制条（像所有播放器那样），双击左右半边 = ±10 秒。
+   *
+   * 用户反馈："进度条一直挂着，太影响强迫症了，点一下能缩下去、再点一下出来。"
+   * 所以：单击切换显隐；控制条出现后 4 秒不再动就自动收起（暂停时保持显示）。
+   */
+  /* 控制条显隐：默认显示，4 秒无操作自动收起 */
+  const [uiVisible, setUiVisible] = useState(true);
+  const uiTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const clearUiTimer = () => {
+    if (uiTimer.current) {
+      clearTimeout(uiTimer.current);
+      uiTimer.current = null;
+    }
+  };
+  const hideLater = () => {
+    clearUiTimer();
+    uiTimer.current = setTimeout(() => setUiVisible(false), 4000);
+  };
+  /** 任何一次交互都把控制条亮出来、并把"自动收起"往后推 4 秒 */
+  const bumpUi = () => {
+    setUiVisible(true);
+    hideLater();
+  };
+  /* 只在**正在播放**时才自动收起；暂停时一直显示，方便你随时点 */
+  useEffect(() => {
+    if (!uiVisible) return;
+    if (playing) hideLater();
+    return clearUiTimer;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [uiVisible, playing]);
+
   const onVideoTap = (x: number, width: number) => {
     const now = Date.now();
     if (now - lastTap.current < 300) {
@@ -501,13 +576,23 @@ function MoviePlayerInner({
       applySeek(livePos.current + delta);
       setScrubTarget(livePos.current + delta);
       setTimeout(() => setScrubTarget(null), 550);
+      bumpUi();
       return;
     }
     lastTap.current = now;
     tapTimer.current = setTimeout(() => {
       tapTimer.current = null;
-      void enterFullscreen();
-    }, 300);
+      setUiVisible((v) => {
+        const next = !v;
+        if (next) {
+          clearUiTimer();
+          uiTimer.current = setTimeout(() => setUiVisible(false), 4000);
+        } else {
+          clearUiTimer();
+        }
+        return next;
+      });
+    }, 260);
   };
 
   /** 拖动时中间的预览气泡：目标时间 + 前后差值 */
@@ -533,7 +618,7 @@ function MoviePlayerInner({
    */
   const syncNow = () => {
     if (!sync) return;
-    const target = computeTargetPosition(sync.mediaState, sync.serverNow);
+    const target = computeTargetPosition(sync.mediaState, serverNowNow());
     try {
       (player as unknown as { currentTime: number }).currentTime = Math.max(0, target);
       setDrift(0);
@@ -552,10 +637,10 @@ function MoviePlayerInner({
   /** 控制条：竖屏和全屏共用 */
   const renderControls = (full: boolean) => (
     <View style={[styles.controls, full ? styles.controlsFull : null]}>
-      <Pressable onPress={toggle} style={styles.playBtn}>
+      <Pressable onPress={() => { bumpUi(); toggle(); }} style={styles.playBtn}>
         <Text style={{ color: '#FFFFFF', fontSize: full ? 18 : 15 }}>{playing ? '⏸' : '▶'}</Text>
       </Pressable>
-      <Pressable onPress={() => seekBy(-10)} style={styles.smallBtn}>
+      <Pressable onPress={() => { bumpUi(); seekBy(-10); }} style={styles.smallBtn}>
         <Text style={styles.smallBtnText}>−10s</Text>
       </Pressable>
       <SeekBar
@@ -567,23 +652,23 @@ function MoviePlayerInner({
       <Text style={styles.time}>
         {formatDuration(position)} / {formatDuration(duration)}
       </Text>
-      <Pressable onPress={() => seekBy(10)} style={styles.smallBtn}>
+      <Pressable onPress={() => { bumpUi(); seekBy(10); }} style={styles.smallBtn}>
         <Text style={styles.smallBtnText}>+10s</Text>
       </Pressable>
       {sync ? (
-        <Pressable onPress={syncNow} style={styles.smallBtn}>
+        <Pressable onPress={() => { bumpUi(); syncNow(); }} style={styles.smallBtn}>
           <Text style={styles.smallBtnText}>同步进度</Text>
         </Pressable>
       ) : null}
-      <Pressable onPress={() => setRateSheet((v) => !v)} style={styles.smallBtn}>
+      <Pressable onPress={() => { bumpUi(); setRateSheet((v) => !v); }} style={styles.smallBtn}>
         <Text style={styles.smallBtnText}>{rate === 1 ? '倍速' : `${rate}x`}</Text>
       </Pressable>
       {sourceSwitcher ? (
-        <Pressable onPress={sourceSwitcher.onPress} style={styles.smallBtn}>
+        <Pressable onPress={() => { bumpUi(); sourceSwitcher.onPress(); }} style={styles.smallBtn}>
           <Text style={styles.smallBtnText}>{sourceSwitcher.label}</Text>
         </Pressable>
       ) : null}
-      <Pressable onPress={full ? () => void exitFullscreen() : () => void enterFullscreen()} style={styles.smallBtn}>
+      <Pressable onPress={() => { bumpUi(); if (full) void exitFullscreen(); else void enterFullscreen(); }} style={styles.smallBtn}>
         <Text style={styles.smallBtnText}>{full ? '✕ 退出' : '⛶ 放大'}</Text>
       </Pressable>
     </View>
@@ -652,6 +737,8 @@ function MoviePlayerInner({
   // ---- 弹幕：按播放位置把弹幕放到画面上 ----
   const [lanes, setLanes] = useState<Array<{ key: string; text: string; lane: number }>>([]);
   const shownRef = useRef<Set<string>>(new Set());
+  /** 「文本 + 秒级位置」→ 上次飘出来的时刻（同一条弹幕不重复飘，见 DANMAKU_TEXT_DEDUPE） */
+  const recentTextRef = useRef<Map<string, number>>(new Map());
   const laneCursor = useRef(0);
   /** 自动重挂计数（最多 2 次，避免无限重挂） */
   const remounts = useRef(0);
@@ -705,6 +792,15 @@ function MoviePlayerInner({
       if (shownRef.current.has(d.id)) continue;
       if (d.mediaPosSec > nowSec + 0.6 || d.mediaPosSec < nowSec - 3) continue;
       shownRef.current.add(d.id);
+      /*
+       * DANMAKU_TEXT_DEDUPE：同一条弹幕在服务端可能被落成两条
+       * （本地乐观一条 + 服务端一条，id 不同），用户实测「发一次飘出来俩」。
+       * 这里按「文本 + 秒级位置」在 8 秒内再兜一层，两条只会飘一条。
+       */
+      const textKey = `${d.text}|${Math.round(d.mediaPosSec)}`;
+      const seenAt = recentTextRef.current.get(textKey) ?? 0;
+      if (Date.now() - seenAt < 8000) continue;
+      recentTextRef.current.set(textKey, Date.now());
       const lane = laneCursor.current % 4;
       laneCursor.current += 1;
       const key = `${d.id}-${Date.now()}`;
@@ -761,7 +857,7 @@ function MoviePlayerInner({
             ) : null}
           </View>
         ) : null}
-        {title ? (
+        {title && uiVisible ? (
           <View style={styles.titleBar}>
             <Text style={[font.tiny, { color: '#FFFFFF' }]} numberOfLines={1}>
               {title}
@@ -769,23 +865,31 @@ function MoviePlayerInner({
           </View>
         ) : null}
         {/* 点画面也能直接放大，符合手机看片的直觉 */}
-        <Pressable style={styles.expandHot} onPress={() => void enterFullscreen()}>
-          <Text style={styles.expandHint}>⛶</Text>
-        </Pressable>
+        {uiVisible ? (
+          <Pressable style={styles.expandHot} onPress={() => void enterFullscreen()}>
+            <Text style={styles.expandHint}>⛶</Text>
+          </Pressable>
+        ) : null}
       </View>
 
-      {renderControls(false)}
-      {renderRates()}
+      {uiVisible ? renderControls(false) : null}
+      {uiVisible ? renderRates() : null}
 
       {sync ? (
+        /* 同步胶囊：暗底上的玻璃片，别再是一行灰字 */
         <View style={styles.syncBar}>
-          <Text style={[font.tiny, { color: color.inkSoft }]}>
-            {sync.isLeader ? '你为主控（位置由你决定）' : '跟随中'} · 偏差{' '}
-            {drift >= 0 ? '+' : ''}
-            {drift.toFixed(2)}s
-            {Math.abs(drift) > 1.5 ? ' · 已自动校准' : ''}
-            {rate !== 1 ? ` · ${rate}x` : ''}
-          </Text>
+          <View style={styles.syncPill}>
+            <Text style={styles.syncPillInk}>
+              {sync.isLeader ? '🎬 你掌着进度' : '💞 跟着 TA 的进度'}
+            </Text>
+            <View style={styles.syncDot} />
+            <Text style={styles.syncPillNum}>
+              {drift >= 0 ? '+' : ''}
+              {drift.toFixed(2)}s
+            </Text>
+            {Math.abs(drift) > 1.5 ? <Text style={styles.syncPillWarn}>校准中</Text> : null}
+            {rate !== 1 ? <Text style={styles.syncPillNum}>{rate}x</Text> : null}
+          </View>
         </View>
       ) : null}
 
@@ -808,8 +912,8 @@ function MoviePlayerInner({
               </View>
             ) : null}
           </View>
-          {renderControls(true)}
-          {renderRates()}
+          {uiVisible ? renderControls(true) : null}
+          {uiVisible ? renderRates() : null}
         </View>
       </Modal>
     </View>
@@ -1056,7 +1160,27 @@ const styles = StyleSheet.create({
   },
   progressFill: { height: 5, backgroundColor: color.primary },
   time: { ...font.tiny, color: color.inkSoft, fontVariant: ['tabular-nums'] },
-  syncBar: { marginTop: 6 },
+  syncBar: { marginTop: 6, flexDirection: 'row' },
+  syncPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 999,
+    backgroundColor: 'rgba(255,255,255,0.16)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.26)',
+  },
+  syncPillInk: { fontSize: 10.5, fontWeight: '700', color: 'rgba(255,255,255,0.92)' },
+  syncDot: { width: 4, height: 4, borderRadius: 2, backgroundColor: 'rgba(255,255,255,0.42)' },
+  syncPillNum: {
+    fontSize: 10.5,
+    fontWeight: '600',
+    color: 'rgba(255,255,255,0.72)',
+    fontVariant: ['tabular-nums'],
+  },
+  syncPillWarn: { fontSize: 10, fontWeight: '700', color: '#FFD8A8' },
   rateRow: { flexDirection: 'row', gap: 8, marginTop: 8, flexWrap: 'wrap' },
   rateChip: {
     paddingHorizontal: 12,

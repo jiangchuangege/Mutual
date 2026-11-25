@@ -1,4 +1,4 @@
-﻿import AsyncStorage from '@react-native-async-storage/async-storage';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useFocusEffect, usePathname, useRouter } from 'expo-router';
 import {
   fmCurrentSec,
@@ -272,8 +272,13 @@ export default function JiaojiaoFmScreen() {
       return true;
     });
     setItems(keep);
-    // 关键：把"还剩哪些条目"写回缓存，否则下次进来又读回旧数据
-    void AsyncStorage.setItem(ITEMS_KEY, JSON.stringify(keep.slice(0, 600))).catch(() => undefined);
+    // 关键：把"还剩哪些条目"写回缓存，否则下次进来又读回旧数据。
+    // 只写文件缓存（fm:items）—— AsyncStorage 在 Android 上是 6MB 的 SQLite 库，
+    // 几条整库条目就能把它写满，然后把账号会话一起写坏（真实事故）。
+    void writeCmsCache(FM_ITEMS_CACHE_KEY, {
+      items: keep.slice(0, 600),
+      at: Date.now(),
+    } as FmItemsCache);
 
     if (playing && !keep.some((i) => i.key === playing.key)) {
       /* 正在放的那一集被删了：引擎里也停掉，别在后台继续响 */
@@ -452,7 +457,6 @@ export default function JiaojiaoFmScreen() {
       sourceKey: use.map((s) => s.url).join('|'),
     };
     void writeCmsCache(FM_ITEMS_CACHE_KEY, cacheBox);
-    void AsyncStorage.setItem(ITEMS_KEY, JSON.stringify(dedup.slice(0, 600))).catch(() => undefined);
     setReports(nextReports);
     setLoading(false);
     /* 拉的过程中源列表又变多了（对方刚加了一个）：自动补一轮 */
