@@ -9,6 +9,8 @@ import {
   extTitleOf,
   fmtClock,
   playerName,
+  startSyncLoop,
+  stopSyncLoop,
   useExternalSession,
   type ExternalSession,
 } from './externalPlayer';
@@ -43,28 +45,29 @@ export function ExternalPlayerCard({
   const posSec = session ? session.positionMs / 1000 : 0;
   const durSec = session ? session.durationMs / 1000 : 0;
 
-  /* 把自己这边的外部进度报给对方（每 2 秒一次，和主控心跳一个节奏） */
-  useEffect(() => {
-    if (!session || !key) return;
-    const now = Date.now();
-    if (now - lastPushAt.current < 2000) return;
-    lastPushAt.current = now;
-    onPush({ itemKey: key, positionSec: posSec, playing: session.playing });
-  }, [session?.positionMs, session?.playing, key, posSec, onPush, session]);
+  /*
+   * 后台同步环：开着「跟随」又拿到授权就常驻 —— 人切回喜马拉雅、我们界面在后台时
+   * 也继续上报进度并对齐。以前只在页面可见时跑，一回到喜马拉雅同步就断了。
+   */
+  const partnerRef = useRef(partner);
+  partnerRef.current = partner;
+  const pushRef = useRef(onPush);
+  pushRef.current = onPush;
+  const toastRef = useRef(onToast);
+  toastRef.current = onToast;
 
-  /* 自动跟随：对方也在放同一集，差超过 3 秒就把自己这边拽过去（6 秒最多一次） */
   useEffect(() => {
-    if (!autoFollow || !session || !key || !partner) return;
-    if (partner.itemKey !== key) return;
-    const diff = posSec - partner.positionSec;
-    if (Math.abs(diff) < 3) return;
-    const now = Date.now();
-    if (now - lastSeekAt.current < 6000) return;
-    lastSeekAt.current = now;
-    if (!session.canSeek) return;
-    extControl(session, 'seek', partner.positionSec);
-    onToast(`已对齐到 TA 的 ${fmtClock(partner.positionSec)}`);
-  }, [autoFollow, session, key, partner, posSec, onToast]);
+    if (!granted || !autoFollow) {
+      stopSyncLoop();
+      return;
+    }
+    startSyncLoop({
+      getPartner: () => partnerRef.current,
+      push: (input) => pushRef.current(input),
+      onAlign: (sec) => toastRef.current(`已对齐到 TA 的 ${fmtClock(sec)}`),
+    });
+    // 卸载时不停：后台还要同步；关掉跟随才停
+  }, [granted, autoFollow]);
 
   if (!available) return null;
 

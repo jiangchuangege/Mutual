@@ -105,3 +105,61 @@ export function fmtClock(sec: number): string {
   }
   return `${m}:${String(r).padStart(2, '0')}`;
 }
+
+/* =========================================================================
+ * 后台同步环
+ *
+ * 真实用法是：两边都打开喜马拉雅听同一集，人盯着的是喜马拉雅，我们的 App 在后台。
+ * 所以同步不能只在「焦焦FM 页面可见时」跑 —— 那个环要活在整个进程里：
+ *   · 每 2 秒把自己这边的外部进度报给 TA（走一起听的 fmProgress 通道）；
+ *   · 开着跟随时，发现和 TA 差 >6 秒就把自己这边拽过去（6 秒最多一次）。
+ * 关掉「跟随」或退出 App 时停。
+ * ========================================================================= */
+type SyncTarget = {
+  /** 读对方最新进度（每次现取，避免闭包拿到旧值） */
+  getPartner: () => { itemKey: string; positionSec: number; playing: boolean } | null;
+  push: (input: { itemKey: string; positionSec: number; playing: boolean }) => void;
+  onAlign?: (sec: number) => void;
+};
+
+let loopTimer: ReturnType<typeof setInterval> | null = null;
+let loopTarget: SyncTarget | null = null;
+let lastPushAt = 0;
+let lastAlignAt = 0;
+
+export function startSyncLoop(target: SyncTarget): void {
+  loopTarget = target;
+  if (loopTimer) return;
+  loopTimer = setInterval(() => {
+    const t = loopTarget;
+    if (!t) return;
+    const live = pickSession();
+    if (!live || live.durationMs <= 0 && !live.playing) return;
+    const key = extKeyOf(live);
+    const posSec = live.positionMs / 1000;
+    const now = Date.now();
+    if (now - lastPushAt >= 2000) {
+      lastPushAt = now;
+      t.push({ itemKey: key, positionSec: posSec, playing: live.playing });
+    }
+    const partner = t.getPartner();
+    if (!partner || partner.itemKey !== key) return;
+    const diff = posSec - partner.positionSec;
+    if (Math.abs(diff) < 6) return;
+    if (now - lastAlignAt < 6000) return;
+    if (!live.canSeek) return;
+    lastAlignAt = now;
+    control(live.package, 'seek', Math.round(partner.positionSec * 1000));
+    t.onAlign?.(partner.positionSec);
+  }, 2000);
+}
+
+export function stopSyncLoop(): void {
+  if (loopTimer) clearInterval(loopTimer);
+  loopTimer = null;
+  loopTarget = null;
+}
+
+export function isSyncLoopRunning(): boolean {
+  return loopTimer !== null;
+}
