@@ -36,9 +36,19 @@ function FmFloatingBar() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
 
-  /* 在 FM 自己的两个页面里不需要这条（那边有完整的迷你条/播放页） */
+  /*
+   * 什么时候**不显示**这条悬浮条：
+   *   1. 在 FM 自己的页面里（那边有完整的迷你条/播放页）；
+   *   2. FM 已经暂停/被别的音源抢走（比如正在看电视、看电影）—— 那时候它只会碍眼；
+   *   3. 正在播视频的页面（直播播放页、观影房间、影院播放）：那会儿屏幕要干净。
+   * 只有"FM 确实在后台响"的时候才挂着，方便随时暂停或回到播放页。
+   */
   const onFmPage = Boolean(pathname && pathname.startsWith('/jiaojiao-fm'));
-  if (!state.item || onFmPage) return null;
+  const videoRoute = ['/live-player', '/room', '/cinema-detail'].some((p) =>
+    Boolean(pathname && pathname.startsWith(p)),
+  );
+  if (!state.item || onFmPage || videoRoute) return null;
+  if (!state.playing) return null;
 
   const mmss = (sec: number) =>
     `${Math.floor(Math.max(0, sec) / 60)}:${String(Math.floor(Math.max(0, sec) % 60)).padStart(2, '0')}`;
