@@ -1385,7 +1385,7 @@ async function handle(req, res) {
     const body = await readBody(req);
     const account = requireAccount(req, res, url, body);
     if (!account) return;
-    const result = runRpc(account.id, String(body.method ?? ''), Array.isArray(body.args) ? body.args : []);
+    const result = runRpc(account.id, String(body.method ?? ''), Array.isArray(body.args) ? body.args : [], String(body.clientId ?? ''));
     json(res, result.ok ? 200 : 400, result);
     return;
   }
@@ -1459,7 +1459,10 @@ const FORBIDDEN = new Set([
   'fastForwardCooling',
 ]);
 
-function runRpc(accountId, method, args) {
+/** 房间 → 当前主控设备（见 runRpc 里的 ONE_LEADER_DEVICE） */
+const leaderDevices = new Map();
+
+function runRpc(accountId, method, args, deviceId = '') {
   const account = db.accounts[accountId];
   if (!account) return fail('账号不存在');
   const role = roleOf(accountId);
@@ -1468,6 +1471,32 @@ function runRpc(accountId, method, args) {
     return fail(`不允许的方法：${method}`);
   }
   const hub = hubOf(account.pairId);
+  /*
+   * ONE_LEADER_DEVICE：主控必须绑到**一台设备**，不能绑到"某一格"。
+   *
+   * 真实事故：同一个账号同时开着手机和另一台设备（测试模拟器就是），两台都以为自己
+   * 是主控（role 相同），于是两个心跳各报各的播放位置 —— 服务端权威位置就在
+   * 1 分钟和 7 分钟之间来回跳，两边画面跟着一起跳。
+   * 现在：一个房间只认一个主控设备；别的设备的心跳一律丢掉（它安静 10 秒以上才让位）。
+   */
+  if (method === 'heartbeat' && deviceId) {
+    const roomId = (() => {
+      try {
+        return hub.snapshot(role)?.activeRoom?.id ?? null;
+      } catch {
+        return null;
+      }
+    })();
+    if (roomId) {
+      const now = Date.now();
+      const cur = leaderDevices.get(roomId);
+      if (!cur || cur.deviceId === deviceId || now - cur.at > 10_000) {
+        leaderDevices.set(roomId, { deviceId, at: now });
+      } else {
+        return ok(null); // 另一台设备才是主控：这次心跳不采纳，也绝不广播
+      }
+    }
+  }
   try {
     /*
      * 手机端是"先上传文件、再登记"。登记时补一次包名解析：
@@ -1536,9 +1565,9 @@ ws = createWebSocketLayer({
   // **每次推送/每次 rpc 都重新解析**：绑定之后同一个连接属于哪一格会变，
   // 用连接建立时缓存的角色会让客户端把对方当成自己（真实事故，见 README）
   roleFor: (client) => (client.accountId ? roleOf(client.accountId) : null),
-  onRpc: (client, method, args) => {
+  onRpc: (client, method, args, clientId) => {
     if (!client.accountId) return fail('请先登录');
-    const result = runRpc(client.accountId, method, args);
+    const result = runRpc(client.accountId, method, args, String(clientId ?? client.clientId ?? ''));
     if (result.ok) bump();
     return result;
   },
