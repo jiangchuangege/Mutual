@@ -636,14 +636,14 @@ function MoviePlayerInner({
 
   /** 控制条：竖屏和全屏共用 */
   const renderControls = (full: boolean) => (
-    <View style={styles.controlsWrap}>
+    <View style={[styles.chrome, full ? styles.chromeFull : null]}>
       {/* 第一行：播放 + ±10s + 进度条 + 时间（永远不能被截断） */}
-      <View style={[styles.controls, full ? styles.controlsFull : null]}>
+      <View style={styles.controls}>
         <Pressable onPress={() => { bumpUi(); toggle(); }} style={styles.playBtn}>
           <Text style={{ color: '#FFFFFF', fontSize: full ? 18 : 15 }}>{playing ? '⏸' : '▶'}</Text>
         </Pressable>
-        <Pressable onPress={() => { bumpUi(); seekBy(-10); }} style={styles.smallBtn}>
-          <Text style={styles.smallBtnText}>−10s</Text>
+        <Pressable onPress={() => { bumpUi(); seekBy(-10); }} style={styles.skipBtn}>
+          <Text style={styles.skipBtnText}>−10s</Text>
         </Pressable>
         <SeekBar
           position={position}
@@ -654,31 +654,32 @@ function MoviePlayerInner({
         <Text style={styles.time}>
           {formatDuration(Math.max(0, position))} / {formatDuration(duration)}
         </Text>
-        <Pressable onPress={() => { bumpUi(); seekBy(10); }} style={styles.smallBtn}>
-          <Text style={styles.smallBtnText}>+10s</Text>
+        <Pressable onPress={() => { bumpUi(); seekBy(10); }} style={styles.skipBtn}>
+          <Text style={styles.skipBtnText}>+10s</Text>
         </Pressable>
       </View>
       {/*
-       * 第二行：同步 / 倍速 / 换源 / 放大。
-       * 以前八颗按钮挤在一行里，窄屏手机上「换源」「放大」直接被切掉了
-       * （用户截图：右边一截没了，看起来像整个 UI 歪了）。现在换行排。
+       * 第二行：同步 / 倍速 / 换源 / 放大 —— 玻璃小药丸，不再是四块白砖。
+       *
+       * 原来八颗按钮挤成一行、还是白底，窄屏被切、暗底上又刺眼（用户原话："有点不太好看"）。
+       * 现在拆两行 + 统一做成暗底玻璃片，和下面那颗"跟着 TA 的进度"胶囊是一套语言。
        */}
       <View style={styles.controlsRow2}>
         {sync ? (
-          <Pressable onPress={() => { bumpUi(); syncNow(); }} style={styles.smallBtn}>
-            <Text style={styles.smallBtnText}>同步进度</Text>
+          <Pressable onPress={() => { bumpUi(); syncNow(); }} style={styles.chipBtn}>
+            <Text style={styles.chipBtnText}>⟳ 同步</Text>
           </Pressable>
         ) : null}
-        <Pressable onPress={() => { bumpUi(); setRateSheet((v) => !v); }} style={styles.smallBtn}>
-          <Text style={styles.smallBtnText}>{rate === 1 ? '倍速' : `${rate}x`}</Text>
+        <Pressable onPress={() => { bumpUi(); setRateSheet((v) => !v); }} style={styles.chipBtn}>
+          <Text style={styles.chipBtnText}>{rate === 1 ? '⏱ 倍速' : `⏱ ${rate}x`}</Text>
         </Pressable>
         {sourceSwitcher ? (
-          <Pressable onPress={() => { bumpUi(); sourceSwitcher.onPress(); }} style={styles.smallBtn}>
-            <Text style={styles.smallBtnText}>{sourceSwitcher.label}</Text>
+          <Pressable onPress={() => { bumpUi(); sourceSwitcher.onPress(); }} style={styles.chipBtn}>
+            <Text style={styles.chipBtnText}>⇄ {sourceSwitcher.label}</Text>
           </Pressable>
         ) : null}
-        <Pressable onPress={() => { bumpUi(); if (full) void exitFullscreen(); else void enterFullscreen(); }} style={styles.smallBtn}>
-          <Text style={styles.smallBtnText}>{full ? '✕ 退出' : '⛶ 放大'}</Text>
+        <Pressable onPress={() => { bumpUi(); if (full) void exitFullscreen(); else void enterFullscreen(); }} style={styles.chipBtn}>
+          <Text style={styles.chipBtnText}>{full ? '✕ 退出' : '⛶ 放大'}</Text>
         </Pressable>
       </View>
     </View>
@@ -1134,6 +1135,17 @@ const styles = StyleSheet.create({
   },
   expandHint: { color: '#FFFFFF', fontSize: 14 },
   controlsWrap: { marginTop: 8 },
+  /** 控制区整体：一块暗玻璃，和下面的同步胶囊同一套语言 */
+  chrome: {
+    marginTop: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 9,
+    borderRadius: 18,
+    backgroundColor: 'rgba(10,8,12,0.55)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.08)',
+  },
+  chromeFull: { marginTop: 10 },
   controls: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -1144,7 +1156,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     flexWrap: 'wrap',
     gap: 6,
-    marginTop: 6,
+    marginTop: 8,
   },
   controlsFull: {
     paddingHorizontal: 16,
@@ -1164,19 +1176,48 @@ const styles = StyleSheet.create({
     paddingHorizontal: 8,
     paddingVertical: 8,
     borderRadius: radius.md,
-    backgroundColor: surf('alt'),
+    backgroundColor: 'rgba(255,255,255,0.14)',
     borderWidth: 1,
-    borderColor: color.line,
+    borderColor: 'rgba(255,255,255,0.18)',
   },
-  smallBtnText: { ...font.tiny, color: color.inkMid, fontWeight: '700' },
+  smallBtnText: { ...font.tiny, color: 'rgba(255,255,255,0.92)', fontWeight: '700' },
+  /** ±10 秒：暗底圆钮 */
+  skipBtn: {
+    width: 44,
+    height: 32,
+    borderRadius: 16,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'rgba(255,255,255,0.12)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.16)',
+  },
+  skipBtnText: { fontSize: 10.5, fontWeight: '700', color: 'rgba(255,255,255,0.9)' },
+  /** 第二行的玻璃药丸：同步 / 倍速 / 换源 / 放大 */
+  chipBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 999,
+    backgroundColor: 'rgba(255,255,255,0.1)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.16)',
+  },
+  chipBtnText: { fontSize: 10.5, fontWeight: '700', color: 'rgba(255,255,255,0.88)', letterSpacing: 0.2 },
   progressTrack: {
     height: 5,
     borderRadius: 3,
-    backgroundColor: surf('alt'),
+    backgroundColor: 'rgba(255,255,255,0.18)',
     overflow: 'hidden',
   },
   progressFill: { height: 5, backgroundColor: color.primary },
-  time: { ...font.tiny, color: color.inkSoft, fontVariant: ['tabular-nums'] },
+  time: {
+    fontSize: 10.5,
+    fontWeight: '600',
+    color: 'rgba(255,255,255,0.7)',
+    fontVariant: ['tabular-nums'],
+  },
   syncBar: { marginTop: 6, flexDirection: 'row' },
   syncPill: {
     flexDirection: 'row',
@@ -1203,12 +1244,12 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
     paddingVertical: 7,
     borderRadius: radius.pill,
-    backgroundColor: surf('alt'),
+    backgroundColor: 'rgba(255,255,255,0.12)',
     borderWidth: 1,
-    borderColor: color.line,
+    borderColor: 'rgba(255,255,255,0.18)',
   },
   rateChipActive: { backgroundColor: color.primary, borderColor: color.primary },
-  rateText: { ...font.tiny, color: color.inkMid, fontWeight: '700' },
+  rateText: { fontSize: 11, color: 'rgba(255,255,255,0.9)', fontWeight: '700' },
   fullRoot: { flex: 1, backgroundColor: '#000000' },
   fullVideoBox: { flex: 1, justifyContent: 'center' },
   videoFull: { width: '100%', height: '100%' },
