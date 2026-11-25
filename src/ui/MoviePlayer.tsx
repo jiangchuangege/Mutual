@@ -887,18 +887,23 @@ function MoviePlayerInner({
       {uiVisible ? renderRates() : null}
 
       {sync ? (
-        /* 同步胶囊：暗底上的玻璃片，别再是一行灰字 */
+        /* 同步胶囊：暗底上的玻璃片，靠右放（左边是播放键，右边对齐才不空） */
         <View style={styles.syncBar}>
           <View style={styles.syncPill}>
             <Text style={styles.syncPillInk}>
               {sync.isLeader ? '🎬 你掌着进度' : '💞 跟着 TA 的进度'}
             </Text>
-            <View style={styles.syncDot} />
-            <Text style={styles.syncPillNum}>
-              {drift >= 0 ? '+' : ''}
-              {drift.toFixed(2)}s
-            </Text>
-            {Math.abs(drift) > 1.5 ? <Text style={styles.syncPillWarn}>校准中</Text> : null}
+            {/* 主控不需要看偏差（位置本来就由自己决定），只给跟随方显示数字 */}
+            {sync.isLeader ? null : (
+              <>
+                <View style={styles.syncDot} />
+                <Text style={styles.syncPillNum}>
+                  {drift >= 0 ? '+' : ''}
+                  {drift.toFixed(2)}s
+                </Text>
+                {Math.abs(drift) > 1.5 ? <Text style={styles.syncPillWarn}>校准中</Text> : null}
+              </>
+            )}
             {rate !== 1 ? <Text style={styles.syncPillNum}>{rate}x</Text> : null}
           </View>
         </View>
@@ -1218,7 +1223,13 @@ const styles = StyleSheet.create({
     color: 'rgba(255,255,255,0.7)',
     fontVariant: ['tabular-nums'],
   },
-  syncBar: { marginTop: 6, flexDirection: 'row' },
+  syncBar: {
+    marginTop: 8,
+    marginBottom: 4,
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    paddingHorizontal: 8,
+  },
   syncPill: {
     flexDirection: 'row',
     alignItems: 'center',
