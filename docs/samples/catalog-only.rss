@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd">
+  <channel>
+    <title>只有目录的示例源（官方页面播放）</title>
+    <link>https://example.com/album/1</link>
+    <description>示例：本 XML 只有节目目录与官方页面链接，不含音频。用来验证焦焦FM 对"目录型 RSS"的处理：整份收进目录、标「官方」、点某一集打开官方页面。</description>
+    <itunes:author>示例主播</itunes:author>
+    <item>
+      <title>1. 示例第 001 集</title>
+      <link>https://example.com/sound/1001</link>
+      <guid isPermaLink="false">1001</guid>
+      <description>时长 00:18:05，官方页面播放。</description>
+      <itunes:duration>00:18:05</itunes:duration>
+    </item>
+    <item>
+      <title>2. 示例第 002 集</title>
+      <link>https://example.com/sound/1002</link>
+      <guid isPermaLink="false">1002</guid>
+      <itunes:duration>00:15:39</itunes:duration>
+    </item>
+    <item>
+      <title>3. 示例第 003 集</title>
+      <link>https://example.com/sound/1003</link>
+      <guid isPermaLink="false">1003</guid>
+      <itunes:duration>00:16:28</itunes:duration>
+    </item>
+    <item>
+      <title>4. 示例第 004 集</title>
+      <link>https://example.com/sound/1004</link>
+      <guid isPermaLink="false">1004</guid>
+      <itunes:duration>00:14:52</itunes:duration>
+    </item>
+    <item>
+      <title>5. 示例第 005 集</title>
+      <link>https://example.com/sound/1005</link>
+      <guid isPermaLink="false">1005</guid>
+      <itunes:duration>00:17:41</itunes:duration>
+    </item>
+    <item>
+      <title>6. 示例第 006 集</title>
+      <link>https://example.com/sound/1006</link>
+      <guid isPermaLink="false">1006</guid>
+      <itunes:duration>00:13:20</itunes:duration>
+    </item>
+  </channel>
+</rss>
