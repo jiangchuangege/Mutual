@@ -17,6 +17,7 @@ import {
   ActivityIndicator,
   Image,
   Keyboard,
+  Linking,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -37,6 +38,7 @@ import {
 } from '../core/jiaojiaoFm';
 import { Btn, Card, useToast } from '../ui/components';
 import { readCmsCache, writeCmsCache } from '../ui/cmsCache';
+import { isInlineUrl, loadInlineText } from '../ui/fmInline';
 import { useApp } from '../store';
 import { cleanEpisodeTitle, mergeProgress } from '../core/jiaojiaoFm';
 import { night, nightFont } from '../ui/nightTheme';
@@ -370,25 +372,41 @@ export default function JiaojiaoFmScreen() {
         const ctrl = new AbortController();
         const timer = setTimeout(() => ctrl.abort(), 8000);
         try {
-          const res = await fetch(s.url, { headers: { accept: '*/*' }, signal: ctrl.signal });
-          const body = await res.text();
-          const parsed = res.ok ? parseSource(body, s) : [];
+          /* 粘贴型源（inline:）：正文就在本机文件缓存里，不用联网 */
+          const inline = isInlineUrl(s.url);
+          let body = '';
+          let httpOk = true;
+          let httpErr: string | null = null;
+          if (inline) {
+            body = await loadInlineText(s.url);
+            if (!body) httpErr = '这段粘贴内容在本机找不到了，重新粘贴一次';
+          } else {
+            const res = await fetch(s.url, { headers: { accept: '*/*' }, signal: ctrl.signal });
+            httpOk = res.ok;
+            if (!res.ok) httpErr = `HTTP ${res.status}`;
+            body = await res.text();
+          }
+          const parsed = httpOk ? parseSource(body, s) : [];
+          /* 目录型源（只有官方页面、没有音频）不算坏，但要说清楚它为什么放不出声 */
+          const catalogOnly = parsed.length > 0 && parsed.every((i) => i.externalOnly);
           return {
             parsed,
             report: {
               url: s.url,
-              status: (!res.ok || parsed.length === 0
+              status: (!httpOk || parsed.length === 0
                 ? 'fail'
                 : Date.now() - t0 > 4000
                   ? 'slow'
                   : 'ok') as FmHealthReport['status'],
               ms: Date.now() - t0,
               count: parsed.length,
-              error: res.ok
+              error: httpOk
                 ? parsed.length
-                  ? null
-                  : '这个源里没有可播放的音频'
-                : `HTTP ${res.status}`,
+                  ? catalogOnly
+                    ? '这份源只有目录、没有音频链接（点一集会打开官方页面）'
+                    : null
+                  : '这个源里没有条目'
+                : httpErr,
               checkedAt: Date.now(),
             } as FmHealthReport,
           };
@@ -556,6 +574,22 @@ export default function JiaojiaoFmScreen() {
   };
 
   const play = (item: FmItem) => {
+    /*
+     * CATALOG_ONLY：这份 RSS 只有目录、没有音频（喜马拉雅付费专辑就长这样）。
+     * 不在 App 里假播（转圈半天什么都听不到），直接打开官方页面，
+     * 用你已经登录/买了会员的官方 App 去放。
+     */
+    if (item.externalOnly || !item.audio) {
+      const url = item.pageUrl || '';
+      if (!url) {
+        toast.show('这一集没有可播地址，也没有官方页面', 'error');
+        return;
+      }
+      void Linking.openURL(url)
+        .then(() => toast.show('已打开官方页面，在那边登录后播放'))
+        .catch(() => toast.show('打不开链接，检查一下系统浏览器', 'error'));
+      return;
+    }
     playFm(item);
     /* 一起听：告诉对方我在听这一集（进度由播放页/引擎每 500ms 续报） */
     try {
@@ -878,6 +912,11 @@ export default function JiaojiaoFmScreen() {
                                 {dur}
                               </Text>
                             ) : null}
+                            {it.externalOnly ? (
+                              <Text style={styles.epRowExt} numberOfLines={1}>
+                                官方
+                              </Text>
+                            ) : null}
                           </Pressable>
                         );
                       })}
@@ -1112,6 +1151,19 @@ const styles = StyleSheet.create({
   epRowNum: { width: 30, color: night.textDim, fontSize: 12, fontWeight: '700' },
   epRowTitle: { flex: 1, color: night.text, fontSize: 13.5, lineHeight: 19 },
   epRowDur: { color: night.textFaint, fontSize: 11 },
+  /** 「官方」小标：这条只有官方页面、App 里点开会跳出去播 */
+  epRowExt: {
+    color: night.cyan,
+    fontSize: 9.5,
+    fontWeight: '700',
+    marginLeft: 6,
+    paddingHorizontal: 5,
+    paddingVertical: 1,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: 'rgba(120,220,255,0.45)',
+    overflow: 'hidden',
+  },
   pager: {
     flexDirection: 'row',
     alignItems: 'center',

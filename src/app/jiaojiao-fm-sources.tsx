@@ -14,6 +14,7 @@ import {
 } from '../core/jiaojiaoFm';
 import { useApp } from '../store';
 import { Btn, useToast } from '../ui/components';
+import { dropInlineSource, isInlineUrl, loadInlineText, saveInlineSource } from '../ui/fmInline';
 import { night } from '../ui/nightTheme';
 import { Aurora } from '../ui/Aurora';
 import { radius, space } from '../ui/theme';
@@ -43,6 +44,8 @@ export default function FmSourcesScreen() {
   const [localSources, setLocalSources] = useState<FmSource[]>([]);
   const [name, setName] = useState('');
   const [url, setUrl] = useState('');
+  const [pasteOpen, setPasteOpen] = useState(false);
+  const [pasteText, setPasteText] = useState('');
   const [scanning, setScanning] = useState(false);
   const [scan, setScan] = useState<LiveScan[]>([]);
 
@@ -96,8 +99,47 @@ export default function FmSourcesScreen() {
   const removeSource = (src: FmSource) => {
     saveLocal(sources.filter((s) => s.id !== src.id && s.url !== src.url));
     store.removeFmSource(src.id);
+    void dropInlineSource(src.url);
     setScan((prev) => prev.filter((s) => s.url !== src.url));
     toast.show('已删除这个收听源');
+  };
+
+  /**
+   * 粘贴 XML/JSON 当源。
+   *
+   * 用户手里经常不是一条网址，而是一整段 XML（别人帮他导出的喜马拉雅专辑目录：
+   * 342 个 item、只有标题+时长+官方页面，没有音频）。这种没法当网址填，
+   * 所以直接把正文存进本机文件缓存，源列表里存一个 inline: 假地址。
+   */
+  const addPasted = () => {
+    const text = pasteText.trim();
+    if (text.length < 20 || !/[<{[]/.test(text.slice(0, 40))) {
+      toast.show('把 RSS/XML 或列表 JSON 的全文粘进来（要以 < 或 { 开头）', 'warn');
+      return;
+    }
+    const id = `jfm_inline_${Date.now().toString(36)}`;
+    const guessName =
+      name.trim() ||
+      (/<title>([\s\S]*?)<\/title>/i.exec(text)?.[1] ?? '').replace(/<[^>]+>/g, '').trim().slice(0, 18) ||
+      '粘贴进来的源';
+    void saveInlineSource(id, text, guessName).then((fakeUrl) => {
+      const src: FmSource = {
+        id,
+        name: guessName,
+        url: fakeUrl,
+        kind: /^\s*[[{]/.test(text) ? 'json' : 'rss',
+        createdAt: Date.now(),
+        enabled: true,
+      };
+      const next = [src, ...sources];
+      saveLocal(next);
+      store.addFmSource(src.name, src.url, src.kind);
+      setPasteText('');
+      setName('');
+      setPasteOpen(false);
+      toast.show('已加入焦焦FM（存在本机，不用联网）');
+      void scanAll(next);
+    });
   };
 
   /** 逐个源检测：拿到条数 + 耗时 + 失败原因 */
@@ -113,16 +155,25 @@ export default function FmSourcesScreen() {
         Promise.race([
           (async () => {
             const t0 = Date.now();
-            const res = await fetch(s.url, { headers: { accept: '*/*' } });
-            const body = await res.text();
-            const items: FmItem[] = res.ok ? parseSource(body, s) : [];
+            const inline = isInlineUrl(s.url);
+            const body = inline ? await loadInlineText(s.url) : await (async () => {
+              const res = await fetch(s.url, { headers: { accept: '*/*' } });
+              if (!res.ok) throw new Error(`HTTP ${res.status}`);
+              return res.text();
+            })();
+            const items: FmItem[] = parseSource(body, s);
             const ms = Date.now() - t0;
+            const catalogOnly = items.length > 0 && items.every((i) => i.externalOnly);
             return {
               url: s.url,
               count: items.length,
               ms,
-              error: res.ok ? (items.length ? null : '这个源里没有可播放的音频') : `HTTP ${res.status}`,
-              status: (!res.ok || items.length === 0 ? 'fail' : ms > 4000 ? 'slow' : 'ok') as LiveScan['status'],
+              error: items.length
+                ? catalogOnly
+                  ? '只有目录、没有音频链接（点一集会打开官方页面）'
+                  : null
+                : '这个源里没有条目',
+              status: (items.length === 0 ? 'fail' : ms > 4000 ? 'slow' : 'ok') as LiveScan['status'],
             };
           })(),
           new Promise<LiveScan>((resolve) =>
@@ -239,6 +290,30 @@ export default function FmSourcesScreen() {
           />
           <View style={{ height: 10 }} />
           <Btn title="＋ 加入" onPress={addSource} />
+          <View style={{ height: 12 }} />
+          <Pressable onPress={() => setPasteOpen((v) => !v)} hitSlop={8} style={styles.pasteToggle}>
+            <Text style={styles.pasteToggleText}>
+              {pasteOpen ? '收起「粘贴 XML / JSON」' : '没有网址？直接粘贴 RSS / XML / JSON 全文 ›'}
+            </Text>
+          </Pressable>
+          {pasteOpen ? (
+            <View style={{ marginTop: 10 }}>
+              <TextInput
+                value={pasteText}
+                onChangeText={setPasteText}
+                placeholder={'把整段 <rss>…</rss> 或列表 JSON 粘在这里'}
+                placeholderTextColor={night.textFaint}
+                multiline
+                style={[styles.input, styles.pasteBox]}
+              />
+              <View style={{ height: 8 }} />
+              <Btn title="把这段加进焦焦FM" variant="soft" onPress={addPasted} />
+              <Text style={styles.hint}>
+                存在本机、不联网解析。像喜马拉雅付费专辑那种「只有目录、没有音频」的 RSS
+                也能整份收进来，点某一集会用系统打开官方页面去听。
+              </Text>
+            </View>
+          ) : null}
           <Text style={styles.hint}>
             RSS 适合播客/有声书站；列表 JSON 适合自己整理的书单；mp3 直链就是单集。
           </Text>
@@ -298,5 +373,8 @@ const styles = StyleSheet.create({
     fontSize: 12.5,
   },
   hint: { color: night.textDim, fontSize: 10.5, marginTop: 8, lineHeight: 16 },
+  pasteToggle: { paddingVertical: 6 },
+  pasteToggleText: { color: night.cyan, fontSize: 11.5, fontWeight: '700' },
+  pasteBox: { minHeight: 96, textAlignVertical: 'top', paddingTop: 10 },
   footNote: { color: night.textFaint, fontSize: 10, textAlign: 'center', marginTop: 4 },
 });

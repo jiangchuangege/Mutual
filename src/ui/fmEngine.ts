@@ -172,6 +172,8 @@ function remember(item: FmItem, positionSec: number): void {
 
 /** 播放某一集（同一集正在放时就是续播 / 定位） */
 export function playFm(item: FmItem, opts: { positionSec?: number; rate?: number } = {}): void {
+  /* CATALOG_ONLY：只有官方页面、没有音频地址的条目，引擎一律不碰（界面改成打开官方页面） */
+  if (!item || item.externalOnly || !item.audio) return;
   ensureAttached();
   const startAt = Math.max(0, opts.positionSec ?? 0);
   const rate = opts.rate ?? state.rate;

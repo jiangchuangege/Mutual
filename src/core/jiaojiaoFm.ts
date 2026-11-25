@@ -37,8 +37,20 @@ export interface FmItem {
   author: string;
   /** 封面（可能为空 → UI 用生成的占位封面） */
   cover: string | null;
-  /** 音频地址（m3u8/mp3/m4a/aac/ogg 都行） */
+  /** 音频地址（m3u8/mp3/m4a/aac/ogg 都行）；CATALOG_ONLY 的条目为空字符串 */
   audio: string;
+  /**
+   * 官方页面地址（喜马拉雅这类"只有目录、不给音频"的 RSS 才有）。
+   *
+   * 用户贴过一份喜马拉雅付费专辑的 RSS：342 个 `<item>` 全都有标题、时长、
+   * `https://www.ximalaya.com/sound/<id>` 的页面链接，但**一个 `<enclosure>` 都没有** ——
+   * 那种 XML 谁都放不出声音来（音频在官方 App 里、要会员）。
+   * 所以这类条目照样收进焦焦FM 当"目录/书签"，点一下就用系统打开官方页面去听，
+   * 而不是假装能播、转圈半天。
+   */
+  pageUrl?: string | null;
+  /** true = 只有官方页面，没有可播音频 */
+  externalOnly?: boolean;
   /** 秒；0 = 未知 */
   duration: number;
   /** 简介（可空） */
@@ -164,6 +176,23 @@ function enclosureUrl(itemXml: string): string {
   return m ? decodeEntities(m[1]).trim() : '';
 }
 
+/**
+ * 条目的「官方页面」地址。
+ *
+ * 喜马拉雅那种 RSS 每条只有 `<link>https://www.ximalaya.com/sound/201713069</link>`
+ * 和一个 `<guid>`（内容和 link 一样）。这里按 link → guid 的顺序取，
+ * 并且只认 http(s)，避免把 "201713069" 这种纯 id 当成链接。
+ */
+function pageLinkOf(itemXml: string): string {
+  const link = tag(itemXml, 'link');
+  if (/^https?:\/\//i.test(link.trim())) return link.trim();
+  const guid = /<guid[^>]*>([\s\S]*?)<\/guid>/i.exec(itemXml)?.[1] ?? '';
+  const g = decodeEntities(guid).trim();
+  if (/^https?:\/\//i.test(g)) return g;
+  const m = /<link[^>]*href=["'](https?:\/\/[^"']+)["']/i.exec(itemXml);
+  return m ? decodeEntities(m[1]).trim() : '';
+}
+
 function decodeEntities(s: string): string {
   return String(s ?? '')
     .replace(/&lt;/g, '<')
@@ -193,8 +222,7 @@ export function parseDuration(input: unknown): number {
 }
 
 /** 稳定短键：同一条音频永远得到同一个 key（去重、记进度都靠它） */
-export function itemKey(audio: string): string {
-  const s = String(audio ?? '').trim();
+export function itemKey(audio: string): string {  const s = String(audio ?? '').trim();
   let h = 2166136261 >>> 0;
   for (let i = 0; i < s.length; i += 1) {
     h ^= s.charCodeAt(i);
@@ -203,8 +231,7 @@ export function itemKey(audio: string): string {
   return `jfm_${h.toString(36)}`;
 }
 
-/** 解析播客 RSS → 条目列表 */
-/**
+/** 解析播客 RSS → 条目列表 *//**
  * 单个源最多收多少条。
  *
  * FM_PARSE_CAP：喜马拉雅那种 RSS 一个专辑 1494 集、单条描述几千字，
@@ -229,18 +256,26 @@ export function parseRss(xml: string, sourceId: string): FmItem[] {
   const items: FmItem[] = [];
   for (const raw of itemBlocksUpTo(channelXml, MAX_FM_ITEMS_PER_SOURCE)) {
     const audio = enclosureUrl(raw);
-    if (!audio || !AUDIO_EXT.test(audio)) continue;
+    const playable = Boolean(audio) && AUDIO_EXT.test(audio);
+    /*
+     * CATALOG_ONLY：没有 enclosure 的 RSS（喜马拉雅付费专辑那种）也收进来当目录。
+     * 以前这里 `if (!audio) continue;` 把整份专辑丢光了，用户「加进去什么都没有」。
+     */
+    const pageUrl = playable ? null : pageLinkOf(raw);
+    if (!playable && !pageUrl) continue;
     const title = tag(raw, 'title') || '未命名';
     const published = Date.parse(tag(raw, 'pubDate') || '') || 0;
     const cover =
       /<itunes:image[^>]*href=["']([^"']+)["']/i.exec(raw)?.[1] ?? channelImage ?? '';
     items.push({
-      key: itemKey(audio),
+      key: itemKey(playable ? audio : String(pageUrl)),
       title,
       album,
       author: tag(raw, 'itunes:author') || tag(raw, 'author') || '',
       cover: cover ? decodeEntities(cover) : null,
-      audio,
+      audio: playable ? audio : '',
+      pageUrl: pageUrl ? decodeEntities(pageUrl) : null,
+      externalOnly: !playable,
       duration: parseDuration(tag(raw, 'itunes:duration')),
       summary: plainText((tag(raw, 'description') || tag(raw, 'summary') || '').slice(0, SUMMARY_CLIP)),
       publishedAt: published,
