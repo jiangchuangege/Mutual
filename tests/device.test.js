@@ -168,20 +168,31 @@ test('暂停时跟随端对齐到暂停位置，不会自己继续走', () => {
   );
 });
 
-test('主控心跳把服务端位置校准到主控真实位置', () => {
+test('心跳不会把主控"本地拖动"写进时间轴（两台设备互相打架的根因）', () => {
   const { hub, devA, clock, step } = setup();
   for (let i = 0; i < 8; i += 1) step();
+  const before = hub.snapshot('A').activeRoom.mediaState;
+  const timeline = (st, at) => st.positionSec + (st.action === 'play' ? (at - st.updatedAtServerMs) / 1000 : 0);
+  const t0 = clock.now ? clock.now() : clock.t;
+  const posBefore = timeline(before, t0);
 
-  // 主控本地播放器被拖动 +20 秒
+  // 主控本地播放器被拖动 +20 秒，然后照常发一次心跳
   devA.seekLocal(devA.player.positionSec + 20);
-  // 心跳间隔按 hub.scaled(2000)=2s，推进足够时间让其发出
   clock.t += 2100;
   devA.tick(250);
   hub.tick();
-  const pos = hub.snapshot('A').activeRoom.mediaState.positionSec;
-  assert.ok(pos > 15, `服务端位置应跟随主控前进，实际 ${pos.toFixed(1)}`);
-});
+  const after = hub.snapshot('A').activeRoom.mediaState;
+  const t1 = clock.now ? clock.now() : clock.t;
+  const posAfter = timeline(after, t1);
 
+  // 时间轴只按真实流逝前进（约 2.1 秒），不会被"主控本地拖动 +20 秒"改写
+  const grew = posAfter - posBefore;
+  assert.ok(grew > 0 && grew < 5, `时间轴应该只前进约 2 秒，实际前进 ${grew.toFixed(2)} 秒`);
+
+  // 真正改位置只有"用户主动 seek"这一条路
+  hub.seek('A', 600);
+  assert.equal(Math.round(hub.snapshot('A').activeRoom.mediaState.positionSec), 600);
+});
 test('时钟偏移不同的两台设备，目标位置计算一致（误差 ≤0.15s）', () => {
   const { devA, devB, step } = setup();
   for (let i = 0; i < 20; i += 1) step();

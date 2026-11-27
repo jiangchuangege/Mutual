@@ -145,11 +145,11 @@ export const ROOM_SYNC_GATE = {
   /** 目标位置小于这个值认为主控还没真正开播，不去校准（避免被拽回 0:00） */
   MIN_TARGET_SEC: 1.5,
   /** 落后多少秒开始追 */
-  LATE_SEC: 2,
+  LATE_SEC: 1.2,
   /** 超前多少秒才允许往回拉 */
-  EARLY_SEC: 6,
+  EARLY_SEC: 2.5,
   /** 两次 seek 的最小间隔 */
-  MIN_GAP_MS: 6000,
+  MIN_GAP_MS: 3000,
 } as const;
 
 export type RoomSyncReason = 'no-target' | 'in-sync' | 'lag' | 'lead' | 'too-soon';

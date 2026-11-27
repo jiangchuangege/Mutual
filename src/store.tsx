@@ -1,4 +1,4 @@
-﻿/**
+/**
  * 全局状态：Hub + 两台模拟设备 + 当前演示角色
  */
 import React, {
@@ -359,6 +359,22 @@ export class AppStore {
           const first = args[0];
           const role = first === 'A' || first === 'B' ? (first as Role) : null;
           if (role === null) return callLocal();
+
+          /*
+           * ROOM_SERVER_ONLY：房间相关的方法在远程模式下**只发给服务器，本地不执行**。
+           *
+           * 这是「进房间后两个房间来回切、进度在 20 分钟和开头之间跳」的总根因：
+           * 以前所有写操作都先在本地跑一遍，于是这台设备本地也建了一个"自己的房间"，
+           * 服务端也有一个房间；两边的 mediaState 交替出现在界面上（seq 3 / seq 2 交替），
+           * 播放器照着两个目标来回跳。
+           *
+           * 房间是强一致的东西（谁在房间、谁准备、进度、谁主控），一律以服务端为准：
+           * 点一下 → 发请求 → 等服务端快照回来 → 界面更新（延迟 < 200ms）。
+           */
+          if (ROOM_SERVER_ONLY.has(name)) {
+            store.forwardRpc(role, name, args.slice(1));
+            return { ok: true, value: null };
+          }
 
           // 远程模式下**所有写操作都先在本地执行一遍**。
           // 以前只对少数"赋值类"方法这么做，其余只是发给服务器、界面等快照回来——
@@ -4243,3 +4259,45 @@ export function useAppOptional(): AppView | null {
     partnerRole: store.partnerRole,
   };
 }
+
+/**
+ * ROOM_SERVER_ONLY：远程模式下这些房间方法**不在本地执行**，只发给服务器。
+ *
+ * 房间是强一致状态：谁在房间里、谁准备好了、进度多少、谁是主控。
+ * 以前"本地先落地再发服务器"，于是本地也生成了一个房间，和服务端那份交替出现，
+ * 播放器就在两个目标之间来回跳（实测 seq 3 / seq 2 每 700ms 交替）。
+ */
+const ROOM_SERVER_ONLY = new Set<string>([
+  'createRoom',
+  'endRoom',
+  'seek',
+  'play',
+  'pause',
+  'pressPlay',
+  'setPlaybackRate',
+  'setRoomSource',
+  'setReady',
+  'requestJoinRoom',
+  'approveJoinRoom',
+  'declineJoinRoom',
+  'requestLead',
+  'grantLead',
+  'denyLead',
+  'requestAction',
+  'grantAction',
+  'denyAction',
+  'transferLeader',
+  'setMediaOffset',
+  'heartbeat',
+  'sendDanmaku',
+  'sendReaction',
+  'toggleScene',
+  'rateMovie',
+  'reviewMovie',
+  'saveRecap',
+  'regenerateRoomCode',
+  'extendRoomCode',
+  'nudgePartner',
+]);
+
+

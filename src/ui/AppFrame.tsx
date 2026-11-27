@@ -1,6 +1,6 @@
 import { usePathname } from 'expo-router';
 import { BlurTargetView } from 'expo-blur';
-import React, { useEffect } from 'react';
+import React, { useEffect, useState } from 'react';
 import { Image, AppState, StyleSheet, View } from 'react-native';
 import { useVideoPlayer, VideoView } from 'expo-video';
 
@@ -198,6 +198,21 @@ export function AppFrame({ children }: { children: React.ReactNode }) {
   setBackdropStill(cbPoster ?? cbUrl ?? null);
   // 同时把所有"表面色"（白卡片 / 奶油卡片 / 弹层）切成全透明
   applySurfaceMode(!!cbUrl);
+
+  /*
+   * SURFACE_KICK：自定义背景是**登录后才从服务端快照里拿到**的。
+   *
+   * 首帧渲染时 cbUrl 还是 null → 开关是关的 → 页面按"不透明白板"画了一遍；
+   * 等快照回来、cbUrl 变成有值，如果这时没有任何东西再触发重渲染，页面就一直停在
+   * 那层白板上（用户实测："我的背景怎么不透明了？"）。
+   *
+   * 以前是靠"主控每 2 秒心跳 → 服务端 notify → 客户端 bump"顺带把界面刷新的；
+   * 现在心跳不再改状态、也不再每跳都推，这条路没了，必须显式踢一次重渲染。
+   */
+  const [, kickSurface] = useState(0);
+  useEffect(() => {
+    kickSurface((n) => n + 1);
+  }, [cbUrl, cb?.type]);
 
   /*
    * 在线心跳：把"当前在哪个模块"上报上去（路径变了立刻发，之后每 30 秒续一次；

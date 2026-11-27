@@ -2469,70 +2469,21 @@ export class Hub {
     return ok(this.toRoomView(room, byRole));
   }
 
-  /** 主控心跳：把服务端权威位置校准到主控真实播放位置 */
-  heartbeat(byRole: Role, positionSec: number, playing: boolean): Result<null> {
+  /**
+   * 心跳：**只表达"我还在房间"，绝不动时间轴**。
+   *
+   * 这是"一起看进度来回跳"的总根因 —— 以前心跳会把 positionSec 往主控的真实
+   * 播放位置"贴"，两个设备（或卡顿的主控 + 跟随方）各报各的，标准位置就在两个值
+   * 之间来回改；跟随方照着这条飘忽的线校准，画面自然一会儿 20 分钟、一会儿开头。
+   *
+   * 现在：房间里那条 { action, positionSec, updatedAtServerMs, rate } 就是唯一时间轴，
+   * 只有用户主动 播放/暂停/拖动/换片 才会改它；两边客户端都按这条时间轴校准自己的播放器。
+   */
+  heartbeat(byRole: Role, _positionSec: number, _playing: boolean): Result<null> {
     const room = this.activeRoom();
     if (!room) return fail('没有进行中的房间');
     this.lastSeen[byRole] = this.now();
-    if (room.leaderRole !== byRole) return ok(null);
-    if (room.state !== 'PLAYING' && room.state !== 'PAUSED') return ok(null);
-    const now = this.now();
-    if (room.mediaState.action === 'play') {
-      room.mediaState.positionSec += Math.max(0, (now - room.mediaState.updatedAtServerMs) / 1000) * room.mediaState.rate;
-    }
-    room.mediaState.updatedAtServerMs = now;
-    /*
-     * HEARTBEAT_ALWAYS_NOTIFY（真凶之一）：
-     *
-     * 以前这里只有在"位置真的改了"时才 notify。可主控每 2 秒的心跳在正常播放时
-     * **几乎从不触发 changed**（位置本来就贴得很近）—— 于是 follow 方的快照一直不刷新，
-     * 它手里的 `updatedAtServerMs` 越来越旧，算出来的目标位置越来越落后，
-     * 只好隔几秒往回 seek 一次：用户看到的正是「一会儿一样、一会儿往回缩/回开头」。
-     *
-     * 心跳本身就是"我还活着、我在这个位置"，必须每跳都推一次。
-     */
-    this.notify();
-    // 保护期：刚由 App 发起 play/pause/seek 后，主控的播放器可能还没跟上，
-    // 此时不要用它的旧位置覆盖权威位置（否则用户会看到"暂停后跳回去"）。
-    if (now < room.holdUntil) return ok(null);
-    /*
-     * 这里的校准必须推出去，否则等于没校准：
-     * revision 只在 notify() 里自增，跟随方靠 mediaState.seq 变化感知新位置。
-     * 以前改完 seq 却全程不 notify，纯观影（没有弹幕/表情这些别的写操作）时
-     * 跟随方永远拿不到这次校准。
-     */
-    /*
-     * LEADER_ZERO_GUARD：主控刚重新进入房间时，播放器还没起来，
-     * 心跳会报 (0s, 未播放)。以前照单全收：服务端位置被清成 0、房间被转成暂停，
-     * 跟随方同步回到 0:00 —— 一场看到一半的电影进度全丢。
-     * 服务端位置已经明显大于 0 时，不采纳"0 秒且未播放"这种"播放器还没起来"的信号。
-     */
-    if (positionSec <= 1 && !playing && room.mediaState.positionSec > 5) {
-      return ok(null);
-    }
-    let changed = false;
-    const drift = Math.abs(room.mediaState.positionSec - positionSec);
-    /*
-     * HEARTBEAT_GLUE：以前阈值是 3 秒 —— 服务端位置按服务器时钟自己往前走，
-     * 只有偏离主控真实播放位置 3 秒以上才拉回来。可采集站的片子几秒卡一下是常态，
-     * 于是服务端位置就成了「每几秒往前窜一点、再被拽回 3 秒」的锯齿。
-     * 跟随方照着这条锯齿校准，表现就是用户看到的「进度一直跳」「一会一样一会往回缩」。
-     * 现在缩到 0.8 秒：服务端的权威位置几乎贴着主控的真实播放位置，
-     * 跟随方看到的是一条平滑的线（这点抖动落在跟随方的死区里，不会触发 seek）。
-     */
-    if (drift > 0.8) {
-      // 主控的真实播放器偏差过大（用户拖动了本地播放器 / 片子卡了一下）→ 服务端跟随主控
-      room.mediaState.positionSec = Math.max(0, positionSec);
-      room.mediaState.seq += 1;
-      changed = true;
-    }
-    if (room.mediaState.action === 'play' !== playing) {
-      room.mediaState.action = playing ? 'play' : 'pause';
-      room.mediaState.seq += 1;
-      changed = true;
-    }
-    /* 上面已经无条件 notify 过一次，这里只在真的有变化时再补一次（seq 变了要再推） */
-    if (changed) this.notify();
+    // 不改位置、不改 updatedAtServerMs、不改 action —— 只让"两个人还在"这件事可见
     return ok(null);
   }
 
@@ -2553,7 +2504,14 @@ export class Hub {
     const room = this.activeRoom();
     if (!room) return fail('没有进行中的房间');
     if (room.leaderRole !== byRole) return ok('needs-lead');
-    this.play(byRole);
+    /*
+     * READY_GATE：以前这里把 play() 的返回值直接吞掉了，无条件返回 ok('ok')。
+     * 于是"两个人都还没点准备好了"的时候，主控点播放，服务端其实拒绝了，
+     * 但客户端以为成功了 —— 界面显示在播、别人还在准备，进度自然对不上。
+     * 现在把真实结果透传出去。
+     */
+    const res = this.play(byRole);
+    if (!res.ok) return fail(res.error);
     return ok('ok');
   }
 

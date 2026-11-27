@@ -127,11 +127,11 @@ test('跟随端落后 4 秒时会被追平（不是不管）', () => {
   assert.ok(d.targetSec > 100);
 });
 
-test('超前 3 秒不往回拉，超前 7 秒才拉', () => {
-  const small = decideRoomSync(103, 100, Number.POSITIVE_INFINITY);
+test('要求秒差 <= 6 秒：超前 2 秒不动，超前 3 秒就拉回', () => {
+  const small = decideRoomSync(102, 100, Number.POSITIVE_INFINITY);
   assert.equal(small.seek, false);
   assert.equal(small.reason, 'in-sync');
-  const big = decideRoomSync(107, 100, Number.POSITIVE_INFINITY);
+  const big = decideRoomSync(103, 100, Number.POSITIVE_INFINITY);
   assert.equal(big.seek, true);
   assert.equal(big.reason, 'lead');
 });
@@ -142,8 +142,8 @@ test('主控还没真正开播（目标 < 1.5 秒）时绝不 seek，避免被�
   assert.equal(d.reason, 'no-target');
 });
 
-test('两次 seek 至少隔 6 秒，防止来回抖', () => {
-  const d = decideRoomSync(100, 104, 3000);
+test('两次 seek 至少隔 3 秒，防止来回抖', () => {
+  const d = decideRoomSync(100, 104, 1500);
   assert.equal(d.seek, false);
   assert.equal(d.reason, 'too-soon');
   const ok = decideRoomSync(100, 104, ROOM_SYNC_GATE.MIN_GAP_MS + 1);

@@ -231,7 +231,7 @@ function MoviePlayerInner({
   const [syncStuck, setSyncStuck] = useState(false);
   const syncStuckRef = useRef(false);
   /** MONOTONIC_SEQ: 同一个房间的 mediaState.seq 只增不减；倒退的就是陈旧快照 */
-  const lastSeqRef = useRef<{ roomId?: string; seq: number }>({ seq: -1 });
+  const lastSeqRef = useRef<{ roomId?: string; seq: number; action?: string; pos?: number }>({ seq: -1 });
   syncStuckRef.current = syncStuck;
   /** 卡顿累计时间：应该播却没往前走超过 3 秒就报一次（房间页据此自动换源） */
   const stalledMs = useRef(0);
@@ -305,7 +305,19 @@ function MoviePlayerInner({
          */
         if (!isPlaying) {
           if (ready) {
-            stalledMs.current += 700;
+            /*
+             * SEEK_GRACE：刚快进/拖动/换源之后必然要重新缓冲几秒，
+             * 这段"没在播"不是卡顿！以前它会累计 3 秒就报 onStall，
+             * 房间于是自动换源 → 重新找源 → 用户看到的就是
+             * 「我一快进它就自己换源，明明刚才那个源是稳的」。
+             * 给 12 秒宽限期：这段窗口里一律不算卡顿。
+             */
+            const lastTouch = Math.max(lastSeekAt.current, lastAskRef.current ? lastAskRef.current.at : 0);
+            if (Date.now() - lastTouch < 12_000) {
+              stalledMs.current = 0;
+            } else {
+              stalledMs.current += 700;
+            }
             if (stalledMs.current >= 3000 && Date.now() - lastStallAt.current > 10_000) {
               lastStallAt.current = Date.now();
               stalledMs.current = 0;
@@ -326,159 +338,174 @@ function MoviePlayerInner({
          */
         onPositionRef.current?.(pos, isPlaying);
 
-        if (!sync) return;
-
-        // 同步校准
-        if (!sync.isLeader) {
-          /*
-           * MONOTONIC_SEQ（真凶）：同一个房间的 mediaState.seq 只会增。
-           * 实测日志里同一个 room 的两份 mediaState 每 700ms 交替出现：
-           *   {seq:3, pos:9}     <- 服务端最新
-           *   {seq:2, pos:1361}  <- 陈旧那份（本地缓存的旧快照）
-           * 于是一会儿目标是 9、一会儿目标是 1361，画面就在 20 分钟和开头之间来回跳。
-           * 这里直接把 seq 倒退的那份丢掉，不参与校准。
-           */
-          const seqNow = sync.mediaState.seq ?? 0;
-          const prevSeq = lastSeqRef.current;
-          if (prevSeq.roomId === sync.roomId && seqNow < prevSeq.seq) return;
-          lastSeqRef.current = { roomId: sync.roomId, seq: seqNow };
-          /*
-           * LEADER_SILENT 优先于校准：主控超过 8 秒没报位置（关了 App/锁屏被掐），
-           * 服务端那条 `positionSec` 就永远停在老地方还带着 action=play。
-           * 这时候千万别拿它当目标 —— 实测会把跟随端一路拉到片子结尾。
-           * 正确做法：暂停，等 TA 回来（对方一按播放就会恢复）。
-           */
-          const silentMs = Date.now() - lastSyncSeenAt.current;
-          if (silentMs > 8000) {
-            if (isPlaying) {
-              try {
-                player.pause();
-              } catch {
-                // 忽略
-              }
-            }
-            if (!leaderSilentRef.current) {
-              leaderSilentRef.current = true;
-              setLeaderSilent(true);
-            }
-            return;
-          }
-          if (leaderSilentRef.current) {
-            leaderSilentRef.current = false;
-            setLeaderSilent(false);
-          }
-          /* 目标位置不能超过片长（目标超了就是数据有问题，别拿着它去 seek） */
-          const rawTarget = computeTargetPosition(sync.mediaState, serverNowNow());
-          const target = dur > 1 ? Math.min(rawTarget, dur - 1) : rawTarget;
-          const cur = pos;
-          const d = cur - target;
-          setDrift((prev) => (Math.abs(prev - d) < 0.2 ? prev : d));
-          /*
-           * SYNC_NO_ZERO_PULL / SYNC_ASYMMETRIC_TOLERANCE 的判定全部收在
-           * core/drift.ts 的 decideRoomSync 里（可被单测覆盖）：
-           *  - 目标 < 1.5 秒一律不 seek，避免还没开播就被拽回 0:00；
-           *  - 落后 2 秒就追，超前要 6 秒才往回拉（往回跳最伤观感）；
-           *  - 两次 seek 至少隔 6 秒。
-           */
-          const decision = decideRoomSync(cur, target, Date.now() - lastSeekAt.current);
-          /* SYNC_TRACE: 临时诊断日志（排查"点了同步之后进度往回跳"），每秒一行 */
-          {
-            const tnow = Date.now();
-            if (!(globalThis as any).__lastTrace || tnow - (globalThis as any).__lastTrace > 1000) {
-              (globalThis as any).__lastTrace = tnow;
-              console.log(
-                'SYNC_TRACE ' + JSON.stringify({
-                  pos: Math.round(cur),
-                  target: Math.round(target),
-                  raw: Math.round(rawTarget),
-                  dur: Math.round(dur),
-                  drift: Math.round(decision.driftSec),
-                  reason: decision.reason,
-                  spark: decision.seek,
-                  updAgeMs: tnow - (sync.mediaState.updatedAtServerMs || 0),
-                  nowAgeMs: tnow - serverNowSeenAt.current,
-                  seq: sync.mediaState.seq,
-                  action: sync.mediaState.action,
-                  room: String(sync.roomId ?? '').slice(-6),
-                  rstate: sync.roomState,
-                  stuck: syncStuckRef.current,
-                  silent: leaderSilentRef.current,
-                  fails: seekFailsRef.current,
-                }),
-              );
-            }
-          }
-          if (decision.seek) {
-            /* SYNC_BACKOFF：上一次 seek 到底有没有生效？没生效就别再死磕 */
-            seekFailsRef.current = countSeekFailure({
-              fails: seekFailsRef.current,
-              askedTarget: lastAskRef.current ? lastAskRef.current.target : null,
-              askedAt: lastAskRef.current ? lastAskRef.current.at : 0,
-              posSec: pos,
-              now: Date.now(),
-            });
-            const giveUp = seekFailsRef.current >= SYNC_GIVE_UP_FAILS;
-            if (giveUp) {
-              /*
-               * 这台设备的片源已经连续 4 次"跳过去又被弹回来"（常见于边下边播的
-               * TS/HLS 源：seek 会把缓冲丢掉重来，位置读回 0）。
-               * 再拽就是用户看到的「一会儿 20 分钟一会儿开头」无限循环 —— 停手，
-               * 老老实实告诉他这台设备不支持自动跳转，让他手动拖一下。
-               */
-              setSyncStuck(true);
-              pendingDriftRef.current = 0;
-            } else {
-              const big = Math.abs(decision.driftSec) > 10;
-              pendingDriftRef.current = big ? 2 : pendingDriftRef.current + 1;
-              if (pendingDriftRef.current >= 2) {
-                pendingDriftRef.current = 0;
-                lastSeekAt.current = Date.now();
-                if (!ready || dur <= 0) {
-                  pendingSeekRef.current = target;
-                } else {
-                  try {
-                    (player as unknown as { currentTime: number }).currentTime = target;
-                    setPosition(target);
-                    setDrift(0);
-                    lastAskRef.current = { target, at: Date.now() };
-                  } catch {
-                    /* 忽略瞬时 seek 失败，下一轮再来 */
-                  }
-                }
-              }
-            }
-          } else {
-            pendingDriftRef.current = 0;
-            /* 已经对齐了：清掉失败计数和"卡住"提示 */
-            if (Math.abs(decision.driftSec) < 3) {
-              seekFailsRef.current = 0;
-              if (syncStuckRef.current) setSyncStuck(false);
-            }
-          }
-          if (sync.mediaState.action === 'play' && !isPlaying) {
-            try {
-              player.play();
-            } catch {
-              // 忽略
-            }
-          }
-          /*
-           * LEADER_SILENT 已经在上面（校准之前）处理过了：
-           * 对方不报位置就直接暂停并 return，不会走到这里拿老目标去 seek。
-           */
-          if (sync.mediaState.action === 'pause' && isPlaying) {
+        /*
+         * NO_ROOM_STOP：房间没了（点了结束观影 / 回忆卡 / 解散）之后，sync 变成 null。
+         * 以前这里直接 return —— 于是播放器再也没人管，**影片继续播**、页面也不切走
+         * （用户实测："点了结束观影影视还不停"）。现在没房间就立刻停。
+         */
+        if (!sync) {
+          if (isPlaying) {
             try {
               player.pause();
             } catch {
-              // 忽略
+              /* 忽略 */
+            }
+          }
+          return;
+        }
+
+        // 同步校准
+        /*
+         * ROOM_STOPPED_GATE：房间只要不是"在演/暂停"，播放器一律停手。
+         * 以前只挡了 PREPARING/COUNTDOWN，于是点了「结束观影」之后
+         * 片单、评分、回忆卡都出来了，**影片还在后台继续播**（用户实测）。
+         */
+        const ROOM_PLAYABLE = ['PLAYING', 'PAUSED', 'PEER_OFFLINE', 'WAITING_RECONNECT'];
+        if (sync.roomState && !ROOM_PLAYABLE.includes(sync.roomState)) {
+          if (isPlaying) {
+            try {
+              player.pause();
+            } catch {
+              /* 忽略 */
+            }
+          }
+          return;
+        }
+        /* WAIT_READY_GATE：房间还没开演（双方没都点准备好）时，谁都不许播 */
+        if (sync.roomState === 'PREPARING' || sync.roomState === 'COUNTDOWN') {
+          if (isPlaying) {
+            try {
+              player.pause();
+            } catch {
+              /* 忽略 */
+            }
+          }
+          return;
+        }
+
+        /*
+         * ===== 时间轴同步（两边完全同一套）=====
+         *
+         * 设计原则：房间里那份 mediaState 就是**唯一标准**——
+         *   { action, positionSec, updatedAtServerMs, rate } 天然就是一条时间轴：
+         *   任意时刻的位置 = positionSec + (服务端现在 - updatedAtServerMs) × rate。
+         *
+         * 所以：
+         *   · 主控**不再每 2 秒上报播放位置**（上报就是"改标准"，两个设备同时报就必然打架）；
+         *   · 主控只在用户 播放/暂停/拖动/换片 时改这条时间轴（那才是真的"改标准"）；
+         *   · 两边客户端都按同一条时间轴校准自己的播放器 —— 主控也不例外，
+         *     所以不存在"主控慢了跟随方跟着乱"的问题；
+         *   · 目标位置永远由时间轴算出来，不再依赖"上一次心跳"，也就不会出现
+         *     陈旧快照、锯齿、20 分钟 ↔ 开头来回跳。
+         */
+        const seqNow = sync.mediaState.seq ?? 0;
+        const prevSeq = lastSeqRef.current;
+        if (prevSeq.roomId === sync.roomId && seqNow < prevSeq.seq) return; // 陈旧快照，丢掉
+        /*
+         * SEQ_STRICT：同一个 seq 只认第一份。
+         *
+         * 实测同一个房间会有两份 mediaState 交替出现（seq 相同、action/position 不同）：
+         * 一份说自己该暂停、另一份说该播放，于是被控端"莫名其妙一直暂停"、进度也乱跳。
+         * 规则：
+         *   · seq 相同、但 action 或位置基准变了 → 这份是陈旧/篡改的，整跳忽略；
+         *   · 只有 seq **严格变大** 才允许改播放状态和位置基准。
+         */
+        if (prevSeq.roomId === sync.roomId && seqNow === prevSeq.seq) {
+          const actionChanged = prevSeq.action !== sync.mediaState.action;
+          const baseJump = Math.abs((sync.mediaState.positionSec || 0) - (prevSeq.pos || 0)) > 3;
+          if (actionChanged || baseJump) return;
+        }
+        lastSeqRef.current = {
+          roomId: sync.roomId,
+          seq: seqNow,
+          action: sync.mediaState.action,
+          pos: sync.mediaState.positionSec || 0,
+        };
+
+        const rawTarget = computeTargetPosition(sync.mediaState, serverNowNow());
+        const target = dur > 1 ? Math.min(rawTarget, dur - 1) : rawTarget;
+        const d = pos - target;
+        setDrift((prev) => (Math.abs(prev - d) < 0.2 ? prev : d));
+
+        /* 播放/暂停：两边都跟标准走（包括主控自己） */
+        if (sync.mediaState.action === 'play' && !isPlaying) {
+          try {
+            player.play();
+          } catch {
+            /* 忽略 */
+          }
+        }
+        if (sync.mediaState.action === 'pause' && isPlaying) {
+          try {
+            player.pause();
+          } catch {
+            /* 忽略 */
+          }
+        }
+
+        /* 位置校准：判据在 core/drift.ts（落后 1.2s 追、超前 2.5s 拉、间隔 3s） */
+        const decision = decideRoomSync(pos, target, Date.now() - lastSeekAt.current);
+        {
+          const tnow = Date.now();
+          if (!(globalThis as any).__lastTrace || tnow - (globalThis as any).__lastTrace > 1000) {
+            (globalThis as any).__lastTrace = tnow;
+            console.log(
+              'SYNC_TRACE ' + JSON.stringify({
+                pos: Math.round(pos),
+                target: Math.round(rawTarget),
+                dur: Math.round(dur),
+                drift: Math.round(decision.driftSec),
+                reason: decision.reason,
+                spark: decision.seek,
+                updAgeMs: tnow - (sync.mediaState.updatedAtServerMs || 0),
+                seq: sync.mediaState.seq,
+                action: sync.mediaState.action,
+                leader: sync.isLeader,
+                room: String(sync.roomId ?? '').slice(-6),
+                rstate: sync.roomState,
+                stuck: syncStuckRef.current,
+                fails: seekFailsRef.current,
+              }),
+            );
+          }
+        }
+        if (decision.seek) {
+          seekFailsRef.current = countSeekFailure({
+            fails: seekFailsRef.current,
+            askedTarget: lastAskRef.current ? lastAskRef.current.target : null,
+            askedAt: lastAskRef.current ? lastAskRef.current.at : 0,
+            posSec: pos,
+            now: Date.now(),
+          });
+          if (seekFailsRef.current >= SYNC_GIVE_UP_FAILS) {
+            /* 这个源跳不过去（边下边播的 TS/HLS 常见）：停手，别让画面来回抽搐 */
+            setSyncStuck(true);
+            pendingDriftRef.current = 0;
+          } else {
+            const big = Math.abs(decision.driftSec) > 10;
+            pendingDriftRef.current = big ? 2 : pendingDriftRef.current + 1;
+            if (pendingDriftRef.current >= 2) {
+              pendingDriftRef.current = 0;
+              lastSeekAt.current = Date.now();
+              if (!ready || dur <= 0) {
+                pendingSeekRef.current = target;
+              } else {
+                try {
+                  (player as unknown as { currentTime: number }).currentTime = target;
+                  setPosition(target);
+                  setDrift(0);
+                  lastAskRef.current = { target, at: Date.now() };
+                } catch {
+                  /* 忽略 */
+                }
+              }
             }
           }
         } else {
-          // 主控：2 秒一次心跳，把真实位置交给服务端
-          const now = Date.now();
-          if (now - lastBeat.current > 2000) {
-            lastBeat.current = now;
-            sync.onHeartbeat(pos, isPlaying);
+          pendingDriftRef.current = 0;
+          if (Math.abs(decision.driftSec) < 3) {
+            seekFailsRef.current = 0;
+            if (syncStuckRef.current) setSyncStuck(false);
           }
         }
       } catch {
@@ -617,6 +644,7 @@ function MoviePlayerInner({
   const applySeek = (target: number) => {
     const upper = liveDur.current > 1 ? liveDur.current - 0.4 : Math.max(0, target);
     const clamped = Math.max(0, Math.min(upper, target));
+    const gap = Math.abs(clamped - livePos.current);
     try {
       (player as unknown as { currentTime: number }).currentTime = clamped;
     } catch {
@@ -625,7 +653,18 @@ function MoviePlayerInner({
     }
     setPosition(clamped);
     setDrift(0);
+    lastSeekAt.current = Date.now();
     onSeek?.(clamped);
+    /*
+     * SEEK_REATTACH：大跨度快进之后，某些采集站的 TS/HLS 流会把画面层弄哑
+     * —— 声音在走、画面停在快进前那一帧（用户："快进后一直加载不出画面"）。
+     * 跨度大就把画面层重挂一次，位置先记下来、挂好立刻跳回去。
+     */
+    if (gap > 8) {
+      if (clamped > 1) pendingSeekRef.current = clamped;
+      setHasFrame(false);
+      setTimeout(() => setVideoKey((k) => k + 1), 350);
+    }
   };
 
   /** 画面上的左右滑动 / 双击：dx 换算成秒数（整屏宽度 ≈ 片长的 1/3，最少 90 秒、最多 10 分钟） */
@@ -940,10 +979,16 @@ function MoviePlayerInner({
       setSlowSource(false);
       return;
     }
+    /*
+     * SLOW_GRACE：刚快进/拖动过就别说"源太慢"。以前快进完画面要重新缓冲，
+     * 12 秒一到就判成源太慢 → 自动换源 → 又缓冲 → 用户看到"快进后自己换源/一直加载"。
+     */
+    const touched = Math.max(lastSeekAt.current, lastAskRef.current ? lastAskRef.current.at : 0);
+    const wait = Math.max(1500, 12_000 - (Date.now() - touched));
     const timer = setTimeout(() => {
       setSlowSource(true);
       onStallRef.current?.();
-    }, 12_000);
+    }, wait);
     return () => clearTimeout(timer);
   }, [hasFrame, url]);
 

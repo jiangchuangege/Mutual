@@ -545,9 +545,15 @@ export default function CinemaDetailScreen() {
                 url={playingUrl}
                 title={vod.name}
                 autoPlay
+                /*
+                 * SWITCHER_REAL_COUNT：以前这里按"集数"决定要不要显示换源，
+                 * 于是只有 1 个播放源、但有 6 集时按钮写着「换源 1/1」，
+                 * 用户完全看不懂（详情页写着 6 个播放地址）。
+                 * 换源按钮只在真的多于一个源时出现。
+                 */
                 sourceSwitcher={
-                  episodes.length > 1
-                    ? { label: `换源 ${activeSource + 1}/${Math.max(1, sources.length)}`, onPress: () => void switchToNextSource() }
+                  sources.length > 1
+                    ? { label: `换源 ${activeSource + 1}/${sources.length}`, onPress: () => void switchToNextSource() }
                     : undefined
                 }
                 onStall={handleStall}

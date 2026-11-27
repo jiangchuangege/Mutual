@@ -316,10 +316,18 @@ export default function RoomScreen() {
       if (stallCount.current === 1) toast.show('网络有点慢…可以让 TA 换个更快的源', 'warn');
       return;
     }
+    /*
+     * STALL_SWITCH_COOLDOWN：换源之后至少给 20 秒"重新起播"的时间。
+     * 以前换完源又开始算卡顿，于是「换源 → 缓冲 → 再判定卡顿 → 再换源」，
+     * 用户看到的就是"它自己一直在重新找源"。
+     */
+    const lastSwitchAt = (globalThis as any).__lastRoomSwitchAt ?? 0;
+    if (Date.now() - lastSwitchAt < 20_000) return;
     if (rankedAlternates.length < 2 || stallCount.current > 4) return;
     const better = rankedAlternates.find((u) => u !== room.sourceUrl);
     if (!better) return;
     const res = store.hub.setRoomSource(role, better, room.movieTitle);
+    if (res.ok) (globalThis as any).__lastRoomSwitchAt = Date.now();
     if (res.ok) {
       toast.show(`这个源太慢，已自动换源（第 ${stallCount.current} 次卡顿）`, 'warn');
     }
@@ -431,16 +439,17 @@ export default function RoomScreen() {
   /**
    * 进房自动开播（用户："视频一直卡在 00:00 不动"）。
    *
-   * 房间的播放是由服务端 mediaState.action 驱动的：action 不是 play，
-   * 本地播放器就永远停在 0:00（这不是片源问题 —— logcat 里解码器都起来了、
-   * 也没有任何源错误）。所以主控进房 1.5 秒后如果还没开始播，就替他发一次 play。
-   * 只做一次；跟随方不主动发，照旧按同步校准。
+   * 注意：**只在房间真的开演（PLAYING/PAUSED）时才补这一次 play**。
+   * 以前不判状态，刚建好房间（WAITING_PEER）1.5 秒就发 play，服务端按准备门禁
+   * 拒绝 → 弹「同步失败：现在不在观影中」—— 用户反馈"每次创建房间都出这个"。
+   * 房间没开演时不该有人去点播放。
    */
   const autoPlayKicked = useRef<string | null>(null);
   useEffect(() => {
     if (!isLeader) return;
     const rid = room.id;
     if (autoPlayKicked.current === rid) return;
+    if (room.state !== 'PLAYING' && room.state !== 'PAUSED') return; // 还没开演：别碰
     if (room.mediaState.action === 'play') {
       autoPlayKicked.current = rid;
       return;
@@ -596,7 +605,12 @@ export default function RoomScreen() {
        * 加上房间页每秒都在 store bump（心跳/同步），表现就是"一进房间就卡、
        * 越滑越卡"。视频和滚动容器天生不兼容，分开就好了。
        */}
-      {room.sourceUrl ? (
+      {/* ENDED_LEAVES_PLAYER：房间结束（ENDED/RECAP/DISSOLVED）后直接把播放器摘掉，
+          以前只是"暂停"，某些源暂停完还会自己续播，用户看到"点了结束它还在放" */}
+      {room.sourceUrl &&
+      room.state !== 'ENDED' &&
+      room.state !== 'RECAP' &&
+      room.state !== 'DISSOLVED' ? (
         <View style={styles.playerDock}>
           {/* 播放器外面套一圈"电影票根"外框：玫瑰色柔光 + 胶片齿孔，别再是块黑砖 */}
           <View style={styles.playerShell}>

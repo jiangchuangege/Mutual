@@ -1592,6 +1592,7 @@ ws = createWebSocketLayer({
     }
     return role;
   },
+
   onHello: (client) => {
     if (!client.accountId) return;
     client.pairId = db.accounts[client.accountId]?.pairId ?? null;
@@ -1611,6 +1612,20 @@ ws = createWebSocketLayer({
     return result;
   },
 });
+
+/*
+ * KEEPALIVE_PUSH：心跳不再改状态之后，安静的房间里服务端可能很久都不 notify，
+ * 客户端就收不到新快照（界面停在旧数据上 —— 例如自定义背景这种"登录后才拿到"的设置
+ * 会一直按首帧的不透明样式画）。每 20 秒推一次当前快照，代价极小。
+ */
+setInterval(() => {
+  try {
+    bump();
+  } catch {
+    /* 忽略 */
+  }
+}, 20_000);
+
 
 // ---------------------------------------------------------------------------
 // 启动
