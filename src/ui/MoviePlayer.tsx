@@ -364,6 +364,31 @@ function MoviePlayerInner({
            *  - 两次 seek 至少隔 6 秒。
            */
           const decision = decideRoomSync(cur, target, Date.now() - lastSeekAt.current);
+          /* SYNC_TRACE: 临时诊断日志（排查"点了同步之后进度往回跳"），每秒一行 */
+          {
+            const tnow = Date.now();
+            if (!(globalThis as any).__lastTrace || tnow - (globalThis as any).__lastTrace > 1000) {
+              (globalThis as any).__lastTrace = tnow;
+              console.log(
+                'SYNC_TRACE ' + JSON.stringify({
+                  pos: Math.round(cur),
+                  target: Math.round(target),
+                  raw: Math.round(rawTarget),
+                  dur: Math.round(dur),
+                  drift: Math.round(decision.driftSec),
+                  reason: decision.reason,
+                  spark: decision.seek,
+                  updAgeMs: tnow - (sync.mediaState.updatedAtServerMs || 0),
+                  nowAgeMs: tnow - serverNowSeenAt.current,
+                  seq: sync.mediaState.seq,
+                  action: sync.mediaState.action,
+                  stuck: syncStuckRef.current,
+                  silent: leaderSilentRef.current,
+                  fails: seekFailsRef.current,
+                }),
+              );
+            }
+          }
           if (decision.seek) {
             /* SYNC_BACKOFF：上一次 seek 到底有没有生效？没生效就别再死磕 */
             seekFailsRef.current = countSeekFailure({
@@ -552,9 +577,9 @@ function MoviePlayerInner({
      * 这里按本地流逝时间外推就会**无限增长** —— 目标位置跟着一路飞，
      * 跟随端于是"永远落后"，一直在往前追（实测：主播停了 10 分钟，
      * 目标跑到 26 分钟、片子只有 22:40）。
-     * 健康时快照 2 秒来一次，外推 5 秒足够；再多就说明对方没在报了。
+     * 健康时快照 2 秒来一次，外推最多 20 秒：正常时快照 2 秒必到（心跳每跳都推），只有网络抖动才用得到这么多。
      */
-    const elapsed = Math.max(0, Math.min(5_000, Date.now() - serverNowSeenAt.current));
+    const elapsed = Math.max(0, Math.min(20_000, Date.now() - serverNowSeenAt.current));
     return serverNowSeenValue.current + elapsed;
   };
   const liveDur = useRef(0);
@@ -720,8 +745,18 @@ function MoviePlayerInner({
       onError?.('对齐进度失败，请重试');
       return;
     }
-    // 跟随方对齐后顺手报一次心跳，让服务端也知道我这边真的跟上了
-    sync.onHeartbeat(Math.max(0, target), sync.mediaState.action === 'play');
+    /*
+     * 只有**主控**才报心跳。
+     *
+     * 用户实测：「后加入房间的人点了同步之后」两边进度开始来回跳。
+     * 当时这里不区分身份：跟随方点一下同步就会发一次"心跳" —— 而心跳在服务端
+     * 等于声明"我是主控、位置由我定"。服务端于是把"主控设备"让给这台跟随设备，
+     * 主控后续心跳被丢掉、位置被跟随方那个值覆盖 → 20 分钟 ↔ 别处无限打架。
+     * 跟随方只需要对齐，不需要声明。
+     */
+    if (sync.isLeader) {
+      sync.onHeartbeat(Math.max(0, target), sync.mediaState.action === 'play');
+    }
   };
 
   const pct = useMemo(() => (duration > 0 ? Math.min(1, position / duration) : 0), [position, duration]);

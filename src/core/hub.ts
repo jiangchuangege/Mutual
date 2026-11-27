@@ -2481,6 +2481,17 @@ export class Hub {
       room.mediaState.positionSec += Math.max(0, (now - room.mediaState.updatedAtServerMs) / 1000) * room.mediaState.rate;
     }
     room.mediaState.updatedAtServerMs = now;
+    /*
+     * HEARTBEAT_ALWAYS_NOTIFY（真凶之一）：
+     *
+     * 以前这里只有在"位置真的改了"时才 notify。可主控每 2 秒的心跳在正常播放时
+     * **几乎从不触发 changed**（位置本来就贴得很近）—— 于是 follow 方的快照一直不刷新，
+     * 它手里的 `updatedAtServerMs` 越来越旧，算出来的目标位置越来越落后，
+     * 只好隔几秒往回 seek 一次：用户看到的正是「一会儿一样、一会儿往回缩/回开头」。
+     *
+     * 心跳本身就是"我还活着、我在这个位置"，必须每跳都推一次。
+     */
+    this.notify();
     // 保护期：刚由 App 发起 play/pause/seek 后，主控的播放器可能还没跟上，
     // 此时不要用它的旧位置覆盖权威位置（否则用户会看到"暂停后跳回去"）。
     if (now < room.holdUntil) return ok(null);
@@ -2520,6 +2531,7 @@ export class Hub {
       room.mediaState.seq += 1;
       changed = true;
     }
+    /* 上面已经无条件 notify 过一次，这里只在真的有变化时再补一次（seq 变了要再推） */
     if (changed) this.notify();
     return ok(null);
   }

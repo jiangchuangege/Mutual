@@ -1507,28 +1507,32 @@ function runRpc(accountId, method, args, deviceId = '') {
   }
   const hub = hubOf(account.pairId);
   /*
-   * ONE_LEADER_DEVICE：主控必须绑到**一台设备**，不能绑到"某一格"。
-   *
-   * 真实事故：同一个账号同时开着手机和另一台设备（测试模拟器就是），两台都以为自己
-   * 是主控（role 相同），于是两个心跳各报各的播放位置 —— 服务端权威位置就在
-   * 1 分钟和 7 分钟之间来回跳，两边画面跟着一起跳。
-   * 现在：一个房间只认一个主控设备；别的设备的心跳一律丢掉（它安静 10 秒以上才让位）。
+   * 两道闸：
+   * ① HEARTBEAT_LEADER_ONLY：心跳只该由主控发。跟随方（尤其"刚点完同步"的那一刻）
+   *    也会发一次心跳，以前这里先处理"主控设备归属"再判身份 —— 结果跟随设备能把
+   *    主控顶掉 10 秒，期间主控心跳全被丢弃、位置被跟随方那个值带偏。用户看到的就是
+   *    「后加入的人点了同步之后，两边进度在 20 分钟和别处之间来回跳」。
+   *    现在：不是主控，直接丢，连归属都不动。
+   * ② ONE_LEADER_DEVICE：主控也只有一台设备能改位置（同账号的手机+平板不互相抢）。
    */
-  if (method === 'heartbeat' && deviceId) {
-    const roomId = (() => {
+  if (method === 'heartbeat') {
+    const room = (() => {
       try {
-        return hub.snapshot(role)?.activeRoom?.id ?? null;
+        return hub.snapshot(role)?.activeRoom ?? null;
       } catch {
         return null;
       }
     })();
-    if (roomId) {
+    if (room && room.leaderRole !== role) return ok(null);
+    if (room && deviceId) {
       const now = Date.now();
-      const cur = leaderDevices.get(roomId);
+      const cur = leaderDevices.get(room.id);
       if (!cur || cur.deviceId === deviceId || now - cur.at > 10_000) {
-        leaderDevices.set(roomId, { deviceId, at: now });
-      } else {
+        leaderDevices.set(room.id, { deviceId, at: now });
+      } else if (cur.deviceId !== deviceId) {
         return ok(null); // 另一台设备才是主控：这次心跳不采纳，也绝不广播
+      } else {
+        leaderDevices.set(room.id, { deviceId, at: now });
       }
     }
   }
