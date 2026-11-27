@@ -325,7 +325,34 @@ function MoviePlayerInner({
 
         // 同步校准
         if (!sync.isLeader) {
-          const target = computeTargetPosition(sync.mediaState, serverNowNow());
+          /*
+           * LEADER_SILENT 优先于校准：主控超过 8 秒没报位置（关了 App/锁屏被掐），
+           * 服务端那条 `positionSec` 就永远停在老地方还带着 action=play。
+           * 这时候千万别拿它当目标 —— 实测会把跟随端一路拉到片子结尾。
+           * 正确做法：暂停，等 TA 回来（对方一按播放就会恢复）。
+           */
+          const silentMs = Date.now() - lastSyncSeenAt.current;
+          if (silentMs > 8000) {
+            if (isPlaying) {
+              try {
+                player.pause();
+              } catch {
+                // 忽略
+              }
+            }
+            if (!leaderSilentRef.current) {
+              leaderSilentRef.current = true;
+              setLeaderSilent(true);
+            }
+            return;
+          }
+          if (leaderSilentRef.current) {
+            leaderSilentRef.current = false;
+            setLeaderSilent(false);
+          }
+          /* 目标位置不能超过片长（目标超了就是数据有问题，别拿着它去 seek） */
+          const rawTarget = computeTargetPosition(sync.mediaState, serverNowNow());
+          const target = dur > 1 ? Math.min(rawTarget, dur - 1) : rawTarget;
           const cur = pos;
           const d = cur - target;
           setDrift((prev) => (Math.abs(prev - d) < 0.2 ? prev : d));
@@ -391,6 +418,10 @@ function MoviePlayerInner({
               // 忽略
             }
           }
+          /*
+           * LEADER_SILENT 已经在上面（校准之前）处理过了：
+           * 对方不报位置就直接暂停并 return，不会走到这里拿老目标去 seek。
+           */
           if (sync.mediaState.action === 'pause' && isPlaying) {
             try {
               player.pause();
@@ -420,6 +451,8 @@ function MoviePlayerInner({
     // 不重置这两个状态就会出现"声音在走、画面定格在退出前那一帧"
     // （用户实测：一开始竖屏正常，横屏看了会儿退出横屏就卡住）。
     setHasFrame(false);
+    /* 重挂会从 0 开始，先把当前进度存起来，等拿到时长再跳回去 */
+    if (livePos.current > 1) pendingSeekRef.current = livePos.current;
     setVideoKey((k) => k + 1);
     try {
       await ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.PORTRAIT_UP);
@@ -490,14 +523,28 @@ function MoviePlayerInner({
    */
   const serverNowSeenAt = useRef(Date.now());
   const serverNowSeenValue = useRef(sync?.serverNow ?? 0);
+  /** 最后一次收到主控新位置的本地时刻：用来判断"对方是不是不报了"（见 LEADER_SILENT） */
+  const lastSyncSeenAt = useRef(Date.now());
+  const [leaderSilent, setLeaderSilent] = useState(false);
+  const leaderSilentRef = useRef(false);
   useEffect(() => {
     if (!sync) return;
     serverNowSeenAt.current = Date.now();
+    lastSyncSeenAt.current = Date.now();
     serverNowSeenValue.current = sync.serverNow;
   }, [sync?.serverNow]);
   /** 估算"现在"的服务端时间（毫秒） */
-  const serverNowNow = () =>
-    serverNowSeenValue.current + Math.max(0, Date.now() - serverNowSeenAt.current);
+  const serverNowNow = () => {
+    /*
+     * SERVERNOW_CLAMP：快照一停（对方关掉 App、房间没人写、或者单纯没变化），
+     * 这里按本地流逝时间外推就会**无限增长** —— 目标位置跟着一路飞，
+     * 跟随端于是"永远落后"，一直在往前追（实测：主播停了 10 分钟，
+     * 目标跑到 26 分钟、片子只有 22:40）。
+     * 健康时快照 2 秒来一次，外推 5 秒足够；再多就说明对方没在报了。
+     */
+    const elapsed = Math.max(0, Math.min(5_000, Date.now() - serverNowSeenAt.current));
+    return serverNowSeenValue.current + elapsed;
+  };
   const liveDur = useRef(0);
   const livePlaying = useRef(false);
   livePos.current = position;
@@ -803,6 +850,13 @@ function MoviePlayerInner({
     if (remounts.current >= 2) return;
     const timer = setTimeout(() => {
       remounts.current += 1;
+      /*
+       * REMOUNT_KEEPS_POSITION：重挂会让播放器从 0 重新开始。
+       * 以前只重挂 → "卡一下 → 回到开头 → 同步校正又拽回 20 分钟"，
+       * 就是用户说的「一会儿 20 分钟一会儿开头」。现在重挂前记下进度，
+       * 拿到时长后由 pendingSeekRef 直接跳回去。
+       */
+      if (livePos.current > 1) pendingSeekRef.current = livePos.current;
       setVideoKey((k) => k + 1);
     }, 3000);
     return () => clearTimeout(timer);
@@ -936,6 +990,7 @@ function MoviePlayerInner({
                 </Text>
                 {Math.abs(drift) > 1.5 && !syncStuck ? <Text style={styles.syncPillWarn}>校准中</Text> : null}
             {syncStuck ? <Text style={styles.syncPillWarn}>这台设备跳不过去</Text> : null}
+            {leaderSilent ? <Text style={styles.syncPillWarn}>TA 那边停住了</Text> : null}
               </>
             )}
             {rate !== 1 ? <Text style={styles.syncPillNum}>{rate}x</Text> : null}
