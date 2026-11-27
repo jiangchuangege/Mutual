@@ -962,8 +962,18 @@ function MoviePlayerInner({
               </View>
             ) : null}
           </View>
-          {uiVisible ? renderControls(true) : null}
-          {uiVisible ? renderRates() : null}
+          {/*
+           * 全屏控制条**浮在画面上**，不再占布局位置。
+           * 用户原话：「横屏之后点击屏幕弹出进度条会把画面弹上去看着好难受」——
+           * 以前控制条是 fullRoot 里的兄弟节点，出现时把 flex:1 的视频挤小了，
+           * 画面就整体往上跳一下。现在绝对定位盖在底部，画面一动不动。
+           */}
+          {uiVisible ? (
+            <View style={[styles.fullChrome, { paddingBottom: insets.bottom + 8 }]} pointerEvents="box-none">
+              {renderControls(true)}
+              {renderRates()}
+            </View>
+          ) : null}
         </View>
       </Modal>
     </View>
@@ -1298,5 +1308,7 @@ const styles = StyleSheet.create({
   rateText: { fontSize: 11, color: 'rgba(255,255,255,0.9)', fontWeight: '700' },
   fullRoot: { flex: 1, backgroundColor: '#000000' },
   fullVideoBox: { flex: 1, justifyContent: 'center' },
+  /** 全屏控制条：绝对定位浮在画面底部，不挤压视频尺寸 */
+  fullChrome: { position: 'absolute', left: 0, right: 0, bottom: 0, paddingHorizontal: 12 },
   videoFull: { width: '100%', height: '100%' },
 });
