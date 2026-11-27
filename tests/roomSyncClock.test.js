@@ -155,3 +155,51 @@ test('暂停状态下目标位置就是主控上报的位置，不会随预演�
   assert.equal(computeTargetPosition(media, 1000), 812);
   assert.equal(computeTargetPosition(media, 999_999), 812);
 });
+
+/* =========================================================================
+ * SYNC_BACKOFF：真实事故「她点同步后 20 分钟 ↔ 开头 无限循环」的回归测试
+ *
+ * 边下边播的源 seek 会丢缓冲、位置读回 0；如果每次都继续拽，用户看到的就是
+ * 无限循环。规则：位置没靠近就记一次失败，连续 4 次就停手并提示。
+ * ========================================================================= */
+const { countSeekFailure, SYNC_GIVE_UP_FAILS } = require('../dist-core/drift.js');
+
+function runStubbornPlayer(ticks = 40) {
+  let pos = 0;
+  let fails = 0;
+  let askedTarget = null;
+  let askedAt = 0;
+  const target = 1200; // 主控在 20:00
+  let seeks = 0;
+  for (let i = 0; i < ticks; i += 1) {
+    const now = i * 700;
+    fails = countSeekFailure({ fails, askedTarget, askedAt, posSec: pos, now });
+    if (fails >= SYNC_GIVE_UP_FAILS) break; // 停手
+    const decision = decideRoomSync(pos, target, askedTarget === null ? Number.POSITIVE_INFINITY : now - askedAt);
+    if (decision.seek) {
+      seeks += 1;
+      askedTarget = target;
+      askedAt = now;
+      pos = 0; // 关键：跳过去又弹回开头
+    }
+  }
+  return { seeks, fails };
+}
+
+test('源不支持跳转时不会无限循环：最多试 4 次就停手', () => {
+  const r = runStubbornPlayer();
+  assert.ok(r.seeks <= SYNC_GIVE_UP_FAILS, `seek 次数 = ${r.seeks}，应该 <= ${SYNC_GIVE_UP_FAILS}`);
+  assert.equal(r.fails, SYNC_GIVE_UP_FAILS);
+});
+
+test('跳转生效（位置真的靠近目标）时失败计数清零，不会被误判成"跳不过去"', () => {
+  let fails = countSeekFailure({ fails: 0, askedTarget: 1200, askedAt: 0, posSec: 1201, now: 5000 });
+  assert.equal(fails, 0);
+  fails = countSeekFailure({ fails: 3, askedTarget: 1200, askedAt: 0, posSec: 1200.4, now: 9000 });
+  assert.equal(fails, 0, '一次成功就要清零，别让历史失败把人锁死');
+});
+
+test('超过 15 秒才回看的那次不算失败（播放器可能还在缓冲，别冤枉它）', () => {
+  const fails = countSeekFailure({ fails: 1, askedTarget: 1200, askedAt: 0, posSec: 0, now: 20_000 });
+  assert.equal(fails, 1, '窗口外不计数');
+});

@@ -184,3 +184,35 @@ export function decideRoomSync(
   }
   return { seek: true, targetSec, driftSec, reason: late ? 'lag' : 'lead' };
 }
+
+/**
+ * SYNC_BACKOFF：seek 到底有没有生效？
+ *
+ * 真实事故（用户实测）：「她在 0 秒，我在 20 分钟；她点了同步，跳到 20 分钟，
+ * 然后又跳回开头，再跳 20，再退回开头 —— 无限循环」。
+ *
+ * 原因是那类边下边播的 TS/HLS 源：seek 会把缓冲丢掉重来，播放器位置读回来是 0；
+ * 我们的校正看到"差了 20 分钟"就又拽一次，于是 20 ↔ 0 死循环。
+ *
+ * 规则：每次 seek 后 15 秒内回看位置——
+ *   · 已经靠近目标（≤5 秒）→ 记成功，清零；
+ *   · 还差得远 → 记一次失败；
+ * 连续 4 次失败就停手（由界面提示"这台设备跳不过去，手动拖一下"），
+ * 而不是每 6 秒再拽一次给用户看无限循环。
+ */
+export const SYNC_GIVE_UP_FAILS = 4;
+export const SYNC_ASK_TOLERANCE_SEC = 5;
+export const SYNC_ASK_WINDOW_MS = 15_000;
+
+export function countSeekFailure(args: {
+  fails: number;
+  askedTarget: number | null;
+  askedAt: number;
+  posSec: number;
+  now: number;
+}): number {
+  const { fails, askedTarget, askedAt, posSec, now } = args;
+  if (askedTarget === null) return fails;
+  if (now - askedAt > SYNC_ASK_WINDOW_MS) return fails;
+  return Math.abs(posSec - askedTarget) > SYNC_ASK_TOLERANCE_SEC ? fails + 1 : 0;
+}

@@ -1219,82 +1219,39 @@ export default function RoomScreen() {
             </View>
 
             {/* 悄悄话：弹幕 + 表情，做成两个人之间的「聊天剧场」 */}
-            <Card>
-              <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-                <View style={{ flex: 1 }}>
-                  <Text style={styles.sectionEyebrow}>WHISPER</Text>
-                  <Text style={styles.sectionTitle}>悄悄话</Text>
-                </View>
-                <View style={styles.privacyPill}>
-                  <Text style={styles.privacyPillInk}>仅我们两人可见</Text>
-                </View>
-              </View>
-              <Text style={styles.sectionHint}>落在当前播放进度上，不公开、不进任何广场。</Text>
-              <View style={styles.danmakuInputRow}>
-                <TextInput
-                  value={draft}
-                  onChangeText={setDraft}
-                  placeholder="说一句悄悄话…（24 字以内）"
-                  placeholderTextColor={color.inkFaint}
-                  maxLength={24}
-                  style={styles.danmakuInput}
-                />
+            {/*
+             * 弹幕条：**不做聊天记录**。
+             * 用户原话：「评论既然是发弹幕就不要有聊天的屏了，太难看了，没眼看」。
+             * 所以这里只留一行：输入框 + 发送 + 四个表情，弹幕直接飘在画面上。
+             */}
+            <View style={styles.danmakuBar}>
+              <TextInput
+                value={draft}
+                onChangeText={setDraft}
+                placeholder="发一条弹幕…（24 字，直接飘在画面上）"
+                placeholderTextColor="rgba(255,255,255,0.45)"
+                maxLength={24}
+                style={styles.danmakuBarInput}
+              />
+              <Pressable
+                onPress={() => {
+                  store.sendDanmaku(draft);
+                  setDraft('');
+                }}
+                style={({ pressed }) => [styles.sendBtn, pressed ? { opacity: 0.85 } : null]}
+              >
+                <Text style={styles.sendBtnInk}>发送</Text>
+              </Pressable>
+              {REACTIONS.map((r) => (
                 <Pressable
-                  onPress={() => {
-                    store.sendDanmaku(draft);
-                    setDraft('');
-                  }}
-                  style={({ pressed }) => [styles.sendBtn, pressed ? { opacity: 0.85 } : null]}
+                  key={r}
+                  onPress={() => store.sendReaction(r)}
+                  style={({ pressed }) => [styles.emojiBtn, pressed ? { opacity: 0.6 } : null]}
                 >
-                  <Text style={styles.sendBtnInk}>发送</Text>
+                  <Text style={{ fontSize: 17 }}>{reactionMeta[r].emoji}</Text>
                 </Pressable>
-              </View>
-              <View style={{ marginTop: 12 }}>
-                {recentDanmaku.length === 0 ? (
-                  <Text style={styles.emptyHint}>还没有悄悄话。看片的时候想说点什么？</Text>
-                ) : (
-                  recentDanmaku.map((d) => {
-                    const mine = d.senderRole === role;
-                    return (
-                      <View key={d.id} style={[styles.bubbleRow, mine ? styles.bubbleRowMine : null]}>
-                        <View style={[styles.bubble, mine ? styles.bubbleMine : styles.bubblePeer]}>
-                          <Text style={[styles.bubbleText, mine ? styles.bubbleTextMine : null]}>
-                            {d.text}
-                          </Text>
-                          <Text style={[styles.bubbleTime, mine ? styles.bubbleTimeMine : null]}>
-                            {formatDuration(d.mediaPosSec)} ·{' '}
-                            {mine ? '我' : snapshot.members[d.senderRole].name}
-                          </Text>
-                        </View>
-                      </View>
-                    );
-                  })
-                )}
-              </View>
-              <View style={{ flexDirection: 'row', gap: 8, marginTop: 14 }}>
-                {REACTIONS.map((r) => (
-                  <Pressable
-                    key={r}
-                    onPress={() => store.sendReaction(r)}
-                    style={({ pressed }) => [styles.reactionCell, pressed ? { opacity: 0.7 } : null]}
-                  >
-                    <Text style={{ fontSize: 20 }}>{reactionMeta[r].emoji}</Text>
-                    <Text style={styles.reactionLabel}>{reactionMeta[r].label}</Text>
-                  </Pressable>
-                ))}
-              </View>
-              <View style={{ marginTop: 10 }}>
-                <Text style={styles.reactionTrail}>
-                  最近反应：
-                  {room.reactions.length === 0
-                    ? ' 暂无'
-                    : room.reactions
-                        .slice(-6)
-                        .map((x) => reactionMeta[x.kind].emoji)
-                        .join(' ')}
-                </Text>
-              </View>
-            </Card>
+              ))}
+            </View>
 
             {/* 我们的小影院场景 */}
             <Card>
@@ -1839,6 +1796,38 @@ const styles = StyleSheet.create({
     backgroundColor: color.mintSoft,
   },
   privacyPillInk: { fontSize: 10, fontWeight: '700', color: color.ok },
+  /** 弹幕条：一行玻璃，暗底上贴着播放器下面 */
+  danmakuBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 7,
+    paddingHorizontal: 8,
+    paddingVertical: 8,
+    borderRadius: 999,
+    backgroundColor: 'rgba(255,255,255,0.13)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.25)',
+    marginBottom: space.md,
+  },
+  danmakuBarInput: {
+    flex: 1,
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+    borderRadius: 999,
+    backgroundColor: 'rgba(0,0,0,0.28)',
+    color: '#FFFFFF',
+    fontSize: 12.5,
+  },
+  emojiBtn: {
+    width: 30,
+    height: 30,
+    borderRadius: 15,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'rgba(255,255,255,0.14)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.22)',
+  },
   sendBtn: {
     paddingHorizontal: 16,
     paddingVertical: 9,

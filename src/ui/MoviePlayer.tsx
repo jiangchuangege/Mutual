@@ -1,5 +1,10 @@
 import * as ScreenOrientation from 'expo-screen-orientation';
-import { computeTargetPosition, decideRoomSync } from '../core/drift';
+import {
+  computeTargetPosition,
+  countSeekFailure,
+  decideRoomSync,
+  SYNC_GIVE_UP_FAILS,
+} from '../core/drift';
 import { useVideoPlayer, VideoView } from 'expo-video';
 
 import { claimAudioFocus, releaseAudioFocus } from '../lib/audioFocus';
@@ -216,6 +221,13 @@ function MoviePlayerInner({
   const lastSeekAt = useRef(0);
   /** 连续多少次 tick 判定"该校准"（见 SYNC_PERSIST：小偏差要连续两次） */
   const pendingDriftRef = useRef(0);
+  /** 上一次真正下发的 seek（用来检查它到底有没有生效） */
+  const lastAskRef = useRef<{ target: number; at: number } | null>(null);
+  /** 连续几次"跳过去又弹回来"（>=4 就停手，见 SYNC_BACKOFF） */
+  const seekFailsRef = useRef(0);
+  const [syncStuck, setSyncStuck] = useState(false);
+  const syncStuckRef = useRef(false);
+  syncStuckRef.current = syncStuck;
   /** 卡顿累计时间：应该播却没往前走超过 3 秒就报一次（房间页据此自动换源） */
   const stalledMs = useRef(0);
   const lastStallAt = useRef(0);
@@ -326,36 +338,51 @@ function MoviePlayerInner({
            */
           const decision = decideRoomSync(cur, target, Date.now() - lastSeekAt.current);
           if (decision.seek) {
-            /*
-             * SYNC_PERSIST：小偏差要"连续两次都偏"才动手。
-             * 服务端位置是台阶式的（主控心跳每 2 秒落一次），偶尔会有 1~2 秒的
-             * 瞬时台阶；每一次都追就成了"进度一直跳"。大偏差（>10 秒，例如主控
-             * 刚拖到别的位置、或换了片）不等，立刻对齐。
-             */
-            const big = Math.abs(decision.driftSec) > 10;
-            pendingDriftRef.current = big ? 2 : pendingDriftRef.current + 1;
-            if (pendingDriftRef.current >= 2) {
-              pendingDriftRef.current = 0;
-              lastSeekAt.current = Date.now();
+            /* SYNC_BACKOFF：上一次 seek 到底有没有生效？没生效就别再死磕 */
+            seekFailsRef.current = countSeekFailure({
+              fails: seekFailsRef.current,
+              askedTarget: lastAskRef.current ? lastAskRef.current.target : null,
+              askedAt: lastAskRef.current ? lastAskRef.current.at : 0,
+              posSec: pos,
+              now: Date.now(),
+            });
+            const giveUp = seekFailsRef.current >= SYNC_GIVE_UP_FAILS;
+            if (giveUp) {
               /*
-               * SYNC_PENDING_WHILE_LOADING：播放器还没拿到时长（换源/缓冲中）时
-               * seek 会被直接丢掉 —— 以前每个 6 秒都去拽一次还没起来的播放器，
-               * 结果就是"一直在加载、进度还一直跳"。这里改成记下来，等真的能播了再跳。
+               * 这台设备的片源已经连续 4 次"跳过去又被弹回来"（常见于边下边播的
+               * TS/HLS 源：seek 会把缓冲丢掉重来，位置读回 0）。
+               * 再拽就是用户看到的「一会儿 20 分钟一会儿开头」无限循环 —— 停手，
+               * 老老实实告诉他这台设备不支持自动跳转，让他手动拖一下。
                */
-              if (!ready || dur <= 0) {
-                pendingSeekRef.current = target;
-              } else {
-                try {
-                  (player as unknown as { currentTime: number }).currentTime = target;
-                  setPosition(target);
-                  setDrift(0);
-                } catch {
-                  // 忽略瞬时 seek 失败，下一轮再来
+              setSyncStuck(true);
+              pendingDriftRef.current = 0;
+            } else {
+              const big = Math.abs(decision.driftSec) > 10;
+              pendingDriftRef.current = big ? 2 : pendingDriftRef.current + 1;
+              if (pendingDriftRef.current >= 2) {
+                pendingDriftRef.current = 0;
+                lastSeekAt.current = Date.now();
+                if (!ready || dur <= 0) {
+                  pendingSeekRef.current = target;
+                } else {
+                  try {
+                    (player as unknown as { currentTime: number }).currentTime = target;
+                    setPosition(target);
+                    setDrift(0);
+                    lastAskRef.current = { target, at: Date.now() };
+                  } catch {
+                    /* 忽略瞬时 seek 失败，下一轮再来 */
+                  }
                 }
               }
             }
           } else {
             pendingDriftRef.current = 0;
+            /* 已经对齐了：清掉失败计数和"卡住"提示 */
+            if (Math.abs(decision.driftSec) < 3) {
+              seekFailsRef.current = 0;
+              if (syncStuckRef.current) setSyncStuck(false);
+            }
           }
           if (sync.mediaState.action === 'play' && !isPlaying) {
             try {
@@ -551,18 +578,18 @@ function MoviePlayerInner({
     clearUiTimer();
     uiTimer.current = setTimeout(() => setUiVisible(false), 4000);
   };
-  /** 任何一次交互都把控制条亮出来、并把"自动收起"往后推 4 秒 */
+  /** 任何一次交互都把控制条亮出来、并把"自动收起"往后推 4 秒（竖屏本来就不收） */
   const bumpUi = () => {
     setUiVisible(true);
-    hideLater();
+    if (fullscreen) hideLater();
   };
-  /* 只在**正在播放**时才自动收起；暂停时一直显示，方便你随时点 */
+  /* 只在**全屏**时才自动收起；竖屏时控制条常驻（用户要求：不要点了才有、点一下又没了） */
   useEffect(() => {
     if (!uiVisible) return;
-    if (playing) hideLater();
+    if (playing && fullscreen) hideLater();
     return clearUiTimer;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [uiVisible, playing]);
+  }, [uiVisible, playing, fullscreen]);
 
   const onVideoTap = (x: number, width: number) => {
     const now = Date.now();
@@ -582,14 +609,16 @@ function MoviePlayerInner({
     lastTap.current = now;
     tapTimer.current = setTimeout(() => {
       tapTimer.current = null;
+      /* 竖屏：控制条常驻，单击不再把它藏起来（用户明确要求）；全屏才切换显隐 */
+      if (!fullscreen) {
+        setUiVisible(true);
+        clearUiTimer();
+        return;
+      }
       setUiVisible((v) => {
         const next = !v;
-        if (next) {
-          clearUiTimer();
-          uiTimer.current = setTimeout(() => setUiVisible(false), 4000);
-        } else {
-          clearUiTimer();
-        }
+        clearUiTimer();
+        if (next) uiTimer.current = setTimeout(() => setUiVisible(false), 4000);
         return next;
       });
     }, 260);
@@ -618,6 +647,10 @@ function MoviePlayerInner({
    */
   const syncNow = () => {
     if (!sync) return;
+    /* 手动补齐：把"跳不过去"的停手状态清掉，重新试一次 */
+    seekFailsRef.current = 0;
+    lastAskRef.current = null;
+    setSyncStuck(false);
     const target = computeTargetPosition(sync.mediaState, serverNowNow());
     try {
       (player as unknown as { currentTime: number }).currentTime = Math.max(0, target);
@@ -901,7 +934,8 @@ function MoviePlayerInner({
                   {drift >= 0 ? '+' : ''}
                   {drift.toFixed(2)}s
                 </Text>
-                {Math.abs(drift) > 1.5 ? <Text style={styles.syncPillWarn}>校准中</Text> : null}
+                {Math.abs(drift) > 1.5 && !syncStuck ? <Text style={styles.syncPillWarn}>校准中</Text> : null}
+            {syncStuck ? <Text style={styles.syncPillWarn}>这台设备跳不过去</Text> : null}
               </>
             )}
             {rate !== 1 ? <Text style={styles.syncPillNum}>{rate}x</Text> : null}
@@ -1099,6 +1133,7 @@ const styles = StyleSheet.create({
   seekBubbleDelta: { color: 'rgba(255,255,255,0.78)', fontSize: 12, marginTop: 2 },
   progressWrap: {
     flex: 1,
+    minWidth: 96,
     height: 30,
     justifyContent: 'center',
   },
