@@ -232,6 +232,8 @@ function MoviePlayerInner({
   const syncStuckRef = useRef(false);
   /** MONOTONIC_SEQ: 同一个房间的 mediaState.seq 只增不减；倒退的就是陈旧快照 */
   const lastSeqRef = useRef<{ roomId?: string; seq: number; action?: string; pos?: number }>({ seq: -1 });
+  /** 连续多少次「房间不可播」（见 PAUSE_HYSTERESIS） */
+  const notPlayableTicks = useRef(0);
   syncStuckRef.current = syncStuck;
   /** 卡顿累计时间：应该播却没往前走超过 3 秒就报一次（房间页据此自动换源） */
   const stalledMs = useRef(0);
@@ -361,8 +363,14 @@ function MoviePlayerInner({
          * 片单、评分、回忆卡都出来了，**影片还在后台继续播**（用户实测）。
          */
         const ROOM_PLAYABLE = ['PLAYING', 'PAUSED', 'PEER_OFFLINE', 'WAITING_RECONNECT'];
+        /*
+         * PAUSE_HYSTERESIS：房间状态偶尔会闪一下（陈旧快照里写着 PREPARING / ENDED），
+         * 以前只要有一次不是可播状态就立刻暂停 - 用户感受就是「莫名其妙突然暂停」。
+         * 现在要连续两次（约 1.4 秒）都不可播才停；恢复可播时计数清零。
+         */
         if (sync.roomState && !ROOM_PLAYABLE.includes(sync.roomState)) {
-          if (isPlaying) {
+          notPlayableTicks.current += 1;
+          if (notPlayableTicks.current >= 2 && isPlaying) {
             try {
               player.pause();
             } catch {
@@ -371,6 +379,7 @@ function MoviePlayerInner({
           }
           return;
         }
+        notPlayableTicks.current = 0;
         /* WAIT_READY_GATE：房间还没开演（双方没都点准备好）时，谁都不许播 */
         if (sync.roomState === 'PREPARING' || sync.roomState === 'COUNTDOWN') {
           if (isPlaying) {

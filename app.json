@@ -2,7 +2,7 @@
   "expo": {
     "name": "Mutual",
     "slug": "twospace",
-    "version": "3.14.29",
+    "version": "3.14.30",
     "orientation": "portrait",
     "scheme": "twospace",
     "icon": "./assets/icon.png",
@@ -22,7 +22,7 @@
       "predictiveBackGestureEnabled": false,
       "edgeToEdgeEnabled": true,
       "package": "com.twospace.app",
-      "versionCode": 31429,
+      "versionCode": 31430,
       "permissions": [
         "android.permission.REQUEST_INSTALL_PACKAGES",
         "android.permission.INTERNET"
