@@ -523,8 +523,11 @@ function MoviePlayerInner({
    */
   const serverNowSeenAt = useRef(Date.now());
   const serverNowSeenValue = useRef(sync?.serverNow ?? 0);
-  /** 最后一次收到主控新位置的本地时刻：用来判断"对方是不是不报了"（见 LEADER_SILENT） */
+  /** 最后一次收到主控新位置的本地时刻：用来判断"对方是不是不报了"（见 LEADER_SILENT）
+   *  必须盯 mediaState.updatedAtServerMs —— 快照本身会因为别的写操作一直刷新，
+   *  用 serverNow 判断静默会把"主控早就没了"误判成"还在报"（实机踩过）。*/
   const lastSyncSeenAt = useRef(Date.now());
+  const lastLeaderValRef = useRef(sync?.mediaState?.updatedAtServerMs ?? 0);
   const [leaderSilent, setLeaderSilent] = useState(false);
   const leaderSilentRef = useRef(false);
   useEffect(() => {
@@ -533,6 +536,15 @@ function MoviePlayerInner({
     lastSyncSeenAt.current = Date.now();
     serverNowSeenValue.current = sync.serverNow;
   }, [sync?.serverNow]);
+
+  /* 主控真的报位置了吗？updatedAtServerMs 变了才算 */
+  useEffect(() => {
+    const v = sync?.mediaState?.updatedAtServerMs ?? 0;
+    if (v !== lastLeaderValRef.current) {
+      lastLeaderValRef.current = v;
+      lastSyncSeenAt.current = Date.now();
+    }
+  }, [sync?.mediaState?.updatedAtServerMs]);
   /** 估算"现在"的服务端时间（毫秒） */
   const serverNowNow = () => {
     /*
