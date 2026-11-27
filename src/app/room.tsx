@@ -365,7 +365,9 @@ export default function RoomScreen() {
       room
         ? {
             mediaState: room.mediaState,
-            serverNow: snapshot.serverNowMs,
+            roomId: room.id,
+            roomState: room.state,
+             serverNow: snapshot.serverNowMs,
             isLeader,
             onHeartbeat: (pos: number, playing: boolean) => {
               store.hub.heartbeat(role, pos, playing);

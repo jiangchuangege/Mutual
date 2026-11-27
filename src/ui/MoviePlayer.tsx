@@ -83,6 +83,9 @@ function MoviePlayerInner({
     mediaState: MediaState;
     serverNow: number;
     isLeader: boolean;
+    /** 房间 id / 状态：诊断「两个房间来回切」用 */
+    roomId?: string;
+    roomState?: string;
     onHeartbeat: (positionSec: number, playing: boolean) => void;
     onRequestPlayPause?: (playing: boolean) => void;
   };
@@ -227,6 +230,8 @@ function MoviePlayerInner({
   const seekFailsRef = useRef(0);
   const [syncStuck, setSyncStuck] = useState(false);
   const syncStuckRef = useRef(false);
+  /** MONOTONIC_SEQ: 同一个房间的 mediaState.seq 只增不减；倒退的就是陈旧快照 */
+  const lastSeqRef = useRef<{ roomId?: string; seq: number }>({ seq: -1 });
   syncStuckRef.current = syncStuck;
   /** 卡顿累计时间：应该播却没往前走超过 3 秒就报一次（房间页据此自动换源） */
   const stalledMs = useRef(0);
@@ -326,6 +331,18 @@ function MoviePlayerInner({
         // 同步校准
         if (!sync.isLeader) {
           /*
+           * MONOTONIC_SEQ（真凶）：同一个房间的 mediaState.seq 只会增。
+           * 实测日志里同一个 room 的两份 mediaState 每 700ms 交替出现：
+           *   {seq:3, pos:9}     <- 服务端最新
+           *   {seq:2, pos:1361}  <- 陈旧那份（本地缓存的旧快照）
+           * 于是一会儿目标是 9、一会儿目标是 1361，画面就在 20 分钟和开头之间来回跳。
+           * 这里直接把 seq 倒退的那份丢掉，不参与校准。
+           */
+          const seqNow = sync.mediaState.seq ?? 0;
+          const prevSeq = lastSeqRef.current;
+          if (prevSeq.roomId === sync.roomId && seqNow < prevSeq.seq) return;
+          lastSeqRef.current = { roomId: sync.roomId, seq: seqNow };
+          /*
            * LEADER_SILENT 优先于校准：主控超过 8 秒没报位置（关了 App/锁屏被掐），
            * 服务端那条 `positionSec` 就永远停在老地方还带着 action=play。
            * 这时候千万别拿它当目标 —— 实测会把跟随端一路拉到片子结尾。
@@ -382,6 +399,8 @@ function MoviePlayerInner({
                   nowAgeMs: tnow - serverNowSeenAt.current,
                   seq: sync.mediaState.seq,
                   action: sync.mediaState.action,
+                  room: String(sync.roomId ?? '').slice(-6),
+                  rstate: sync.roomState,
                   stuck: syncStuckRef.current,
                   silent: leaderSilentRef.current,
                   fails: seekFailsRef.current,
